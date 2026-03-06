@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import io
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import List, Tuple, Optional, Dict
 
 import pandas as pd
@@ -10,10 +11,10 @@ import streamlit as st
 
 
 # ==============================
-# ESTILO TECK (HEADER)
+# ESTILO TECK
 # ==============================
 
-TECK_GREEN = "#007A3D"   # si tienes el HEX exacto, lo cambiamos
+TECK_GREEN = "#007A3D"
 TECK_GREEN_2 = "#00A04A"
 TECK_DARK = "#0B0F14"
 
@@ -105,13 +106,19 @@ DB_PATH = "mediciones.db"
 
 EQUIPOS = [
     "101", "102", "103", "104", "105", "106", "108",
-    "201", "202", "203", "204", "205",  # 205 agregado
+    "201", "202", "203", "204", "205",
     "301", "302", "303",
 ]
 
 EQUIPOS_MOTONIVELADORA = {"301", "302", "303"}
 
-# Reglas: % = DESGASTE (100% malo / 0% bueno)
+# Semana de medición 7x7:
+# Semana 10 = desde 2026-03-05 hasta 2026-03-11
+REF_WEEK_START = date(2026, 3, 5)
+REF_WEEK_NUMBER = 10
+
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+
 REGLAS: Dict[str, dict] = {
     "MOTONIVELADORA": {
         "puntos": [
@@ -154,7 +161,7 @@ REGLAS: Dict[str, dict] = {
 }
 
 HORAS_POR_DIA = 24
-N_TASA = 5  # promedio últimas N mediciones por equipo
+N_TASA = 5
 
 
 # ==============================
@@ -177,14 +184,23 @@ class Resultado:
 
 
 # ==============================
-# DB (init + helpers)
+# SEMANA DE MEDICIÓN
+# ==============================
+
+def calcular_semana_medicion(fecha_dt: datetime) -> tuple[int, str, date, date]:
+    week_offset = (fecha_dt.date() - REF_WEEK_START).days // 7
+    semana = REF_WEEK_NUMBER + week_offset
+    inicio = REF_WEEK_START + timedelta(days=week_offset * 7)
+    fin = inicio + timedelta(days=6)
+    etiqueta = f"Semana {semana}"
+    return semana, etiqueta, inicio, fin
+
+
+# ==============================
+# DB
 # ==============================
 
 def init_db():
-    """
-    Crea una tabla base compatible con tu app.
-    Si tu DB ya existe con más/otras columnas, NO la rompe.
-    """
     with sqlite3.connect(DB_PATH) as con:
         con.execute("""
         CREATE TABLE IF NOT EXISTS mediciones (
@@ -193,6 +209,8 @@ def init_db():
             equipo TEXT NOT NULL,
             ubicacion TEXT,
             usuario TEXT,
+            componente TEXT,
+            mm REAL,
 
             horometro REAL,
             mm_izq REAL,
@@ -205,39 +223,50 @@ def init_db():
 
             tasa_mm_h REAL,
             horas_a_critico REAL,
-            dias_a_critico REAL
+            dias_a_critico REAL,
+
+            semana_medicion INTEGER,
+            semana_label TEXT,
+            inicio_semana TEXT,
+            fin_semana TEXT
         )
         """)
         con.commit()
 
 
 def migrar_db_agregar_columnas():
-    """
-    Agrega columnas nuevas si faltan (no borra datos).
-    """
     with sqlite3.connect(DB_PATH) as con:
         cols = {row[1] for row in con.execute("PRAGMA table_info(mediciones)").fetchall()}
 
         def add(sql_col: str):
             con.execute(f"ALTER TABLE mediciones ADD COLUMN {sql_col}")
 
-        if "fecha" not in cols: add("fecha TEXT")
-        if "equipo" not in cols: add("equipo TEXT")
-        if "ubicacion" not in cols: add("ubicacion TEXT")
-        if "usuario" not in cols: add("usuario TEXT")
+        faltantes = {
+            "fecha": "fecha TEXT",
+            "equipo": "equipo TEXT",
+            "ubicacion": "ubicacion TEXT",
+            "usuario": "usuario TEXT",
+            "componente": "componente TEXT",
+            "mm": "mm REAL",
+            "horometro": "horometro REAL",
+            "mm_izq": "mm_izq REAL",
+            "mm_der": "mm_der REAL",
+            "mm_usada": "mm_usada REAL",
+            "condicion_pct": "condicion_pct REAL",
+            "estado": "estado TEXT",
+            "accion": "accion TEXT",
+            "tasa_mm_h": "tasa_mm_h REAL",
+            "horas_a_critico": "horas_a_critico REAL",
+            "dias_a_critico": "dias_a_critico REAL",
+            "semana_medicion": "semana_medicion INTEGER",
+            "semana_label": "semana_label TEXT",
+            "inicio_semana": "inicio_semana TEXT",
+            "fin_semana": "fin_semana TEXT",
+        }
 
-        if "horometro" not in cols: add("horometro REAL")
-        if "mm_izq" not in cols: add("mm_izq REAL")
-        if "mm_der" not in cols: add("mm_der REAL")
-        if "mm_usada" not in cols: add("mm_usada REAL")
-
-        if "condicion_pct" not in cols: add("condicion_pct REAL")
-        if "estado" not in cols: add("estado TEXT")
-        if "accion" not in cols: add("accion TEXT")
-
-        if "tasa_mm_h" not in cols: add("tasa_mm_h REAL")
-        if "horas_a_critico" not in cols: add("horas_a_critico REAL")
-        if "dias_a_critico" not in cols: add("dias_a_critico REAL")
+        for col, ddl in faltantes.items():
+            if col not in cols:
+                add(ddl)
 
         con.commit()
 
@@ -275,27 +304,23 @@ def guardar_medicion(
     horas_a_critico: Optional[float],
     dias_a_critico: Optional[float],
 ):
-    """
-    INSERT adaptativo al esquema REAL de tu DB.
-    - Si existe 'mm' NOT NULL, se llena con mm_usada.
-    - Si existe 'componente' NOT NULL, se llena con 'Cuchilla'.
-    - Si aparecen otras NOT NULL legacy, se les da default seguro.
-    """
     info = tabla_info("mediciones")
+    now = datetime.now()
+    semana, semana_label, inicio_sem, fin_sem = calcular_semana_medicion(now)
 
-    now = datetime.now().isoformat(timespec="seconds")
     base = {
-        "fecha": now,
+        "fecha": now.isoformat(timespec="seconds"),
         "equipo": equipo,
         "ubicacion": (ubicacion or "").strip() or None,
         "usuario": (usuario or "").strip() or None,
+        "componente": "Cuchilla",
+        "mm": float(mm_usada),
 
         "horometro": float(horometro),
         "mm_izq": float(mm_izq),
         "mm_der": float(mm_der),
         "mm_usada": float(mm_usada),
 
-        # aunque sea desgaste, tu BD lo guarda como condicion_pct
         "condicion_pct": float(desgaste_pct),
         "estado": estado,
         "accion": accion,
@@ -304,9 +329,10 @@ def guardar_medicion(
         "horas_a_critico": float(horas_a_critico) if horas_a_critico is not None else None,
         "dias_a_critico": float(dias_a_critico) if dias_a_critico is not None else None,
 
-        # compat legacy
-        "mm": float(mm_usada),
-        "componente": "Cuchilla",
+        "semana_medicion": int(semana),
+        "semana_label": semana_label,
+        "inicio_semana": inicio_sem.isoformat(),
+        "fin_semana": fin_sem.isoformat(),
     }
 
     columnas = []
@@ -318,8 +344,6 @@ def guardar_medicion(
             continue
 
         val = base.get(name, None)
-
-        # NOT NULL sin default → poner default seguro
         if (val is None) and col["notnull"] and (col["dflt"] is None):
             val = valor_default_por_tipo(col["type"])
 
@@ -337,12 +361,13 @@ def guardar_medicion(
         con.commit()
 
 
-def cargar_historial(limit: int = 300) -> pd.DataFrame:
+def cargar_historial(limit: int = 500) -> pd.DataFrame:
     info = tabla_info("mediciones")
     cols = [c["name"] for c in info if c["name"] != "id"]
 
     preferidas = [
-        "fecha", "equipo", "componente", "ubicacion", "usuario",
+        "id", "fecha", "semana_medicion", "semana_label",
+        "equipo", "componente", "ubicacion", "usuario",
         "horometro", "mm", "mm_izq", "mm_der", "mm_usada",
         "condicion_pct", "estado", "tasa_mm_h", "horas_a_critico", "dias_a_critico",
     ]
@@ -378,12 +403,28 @@ def obtener_ultimas_mediciones_equipo(equipo: str, n: int = N_TASA) -> list[dict
     return [{"horometro": float(h), "mm_usada": float(mm)} for h, mm in rows]
 
 
+def eliminar_mediciones(ids: list[int]) -> int:
+    if not ids:
+        return 0
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.executemany("DELETE FROM mediciones WHERE id = ?", [(int(i),) for i in ids])
+        con.commit()
+        return cur.rowcount
+
+
 # ==============================
 # CÁLCULO
 # ==============================
 
 def regla_por_equipo(equipo: str) -> str:
     return "MOTONIVELADORA" if equipo in EQUIPOS_MOTONIVELADORA else "DOZER_854_D10_D11"
+
+
+def rango_regla(regla: str) -> tuple[float, float]:
+    puntos = REGLAS[regla]["puntos"]
+    xs = [p[0] for p in puntos]
+    return min(xs), max(xs)
 
 
 def interpolar_pct(mm: float, puntos: List[Tuple[float, float]]) -> float:
@@ -410,21 +451,16 @@ def clasificar_desgaste(desgaste_pct: float, umbrales: List[Tuple[str, float, st
 
 
 def calcular_tasa_mm_h_promedio(meds: list[dict]) -> Optional[float]:
-    """
-    Tasa promedio (mm/h) usando tramos consecutivos válidos.
-    Asume que el mm BAJA con el desgaste (mm_prev > mm_actual).
-    """
     if len(meds) < 2:
         return None
 
     tasas = []
-    # meds viene DESC: [más nueva, ..., más antigua]
     for i in range(len(meds) - 1):
         h_new, mm_new = meds[i]["horometro"], meds[i]["mm_usada"]
         h_old, mm_old = meds[i + 1]["horometro"], meds[i + 1]["mm_usada"]
 
         dh = h_new - h_old
-        dmm = mm_old - mm_new  # positivo si bajó el mm
+        dmm = mm_old - mm_new
 
         if dh > 0 and dmm > 0:
             tasas.append(dmm / dh)
@@ -450,7 +486,6 @@ def proyectar_a_critico(mm_usada: float, tasa_mm_h: Optional[float], mm_critico:
 
 def evaluar(equipo: str, horometro: float, mm_izq: float, mm_der: float) -> Resultado:
     mm_usada = min(mm_izq, mm_der)
-
     regla = regla_por_equipo(equipo)
     cfg = REGLAS[regla]
 
@@ -478,6 +513,23 @@ def evaluar(equipo: str, horometro: float, mm_izq: float, mm_der: float) -> Resu
 
 
 # ==============================
+# REPORTES
+# ==============================
+
+def ultimos_estados_por_equipo(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df2 = df.copy()
+    df2["fecha_dt"] = pd.to_datetime(df2["fecha"], errors="coerce")
+    df2 = df2.sort_values("fecha_dt", ascending=False)
+    return df2.drop_duplicates(subset=["equipo"], keep="first")
+
+
+def generar_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+# ==============================
 # UI
 # ==============================
 
@@ -486,9 +538,26 @@ st.set_page_config(page_title="Teck · GET Wear Monitor", layout="wide")
 inject_teck_style()
 init_db()
 migrar_db_agregar_columnas()
-
 render_header()
 
+# ------------------------------
+# Sidebar admin
+# ------------------------------
+with st.sidebar:
+    st.subheader("Administración")
+
+    admin_ok = False
+    if ADMIN_PASSWORD:
+        pwd = st.text_input("Clave administrador", type="password")
+        admin_ok = (pwd == ADMIN_PASSWORD)
+        if admin_ok:
+            st.success("Modo administrador activo")
+    else:
+        st.info("Para eliminar mediciones, define ADMIN_PASSWORD en Secrets de Streamlit.")
+
+# ------------------------------
+# Layout principal
+# ------------------------------
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
@@ -508,12 +577,27 @@ with col1:
 
     if st.button("Evaluar y guardar", type="primary"):
         if not usuario.strip():
-            st.error("Debes ingresar el nombre del técnico (Usuario).")
+            st.error("Debes ingresar el nombre del técnico.")
         elif horometro <= 0:
             st.error("Debes ingresar un horómetro válido (> 0).")
         else:
+            regla = regla_por_equipo(equipo)
+            mm_min, mm_max = rango_regla(regla)
+
+            errores = []
+            if not (mm_min <= mm_izq <= mm_max):
+                errores.append(f"Medición izquierda fuera de rango permitido ({mm_min} a {mm_max} mm).")
+            if not (mm_min <= mm_der <= mm_max):
+                errores.append(f"Medición derecha fuera de rango permitido ({mm_min} a {mm_max} mm).")
+
+            if errores:
+                for e in errores:
+                    st.error(e)
+                st.stop()
+
             res = evaluar(equipo, horometro, mm_izq, mm_der)
             cfg = REGLAS[res.regla]
+            semana, semana_label, ini_sem, fin_sem = calcular_semana_medicion(datetime.now())
 
             guardar_medicion(
                 equipo=equipo,
@@ -531,7 +615,7 @@ with col1:
                 dias_a_critico=res.dias_a_critico,
             )
 
-            st.success(f"Medición guardada correctamente. Regla aplicada: {res.regla}")
+            st.success(f"Medición guardada correctamente. Regla aplicada: {res.regla} · {semana_label} ({ini_sem} a {fin_sem})")
 
             st.metric("Mm usada (menor)", f"{res.mm_usada:.2f}")
             st.metric(cfg["label_pct"], f"{res.desgaste_pct:.1f}")
@@ -540,18 +624,152 @@ with col1:
 
             if res.tasa_mm_h is None:
                 st.info(
-                    f"Tasa mm/h: sin datos suficientes (necesitas al menos 2 mediciones válidas). "
+                    f"Tasa mm/h: sin datos suficientes. "
                     f"Promedio últimas {N_TASA} mediciones por equipo."
                 )
             else:
-                st.info(f"Tasa estimada (promedio): {res.tasa_mm_h} mm/h (mm bajando por desgaste)")
+                st.info(f"Tasa estimada (promedio): {res.tasa_mm_h} mm/h")
 
             if res.horas_a_critico is None:
-                st.warning("Proyección a crítico: no disponible (sin tasa mm/h válida).")
+                st.warning("Proyección a crítico: no disponible.")
             else:
                 st.warning(f"Proyección a CRÍTICO (mm <= {cfg['mm_critico']}): ~{res.horas_a_critico} h (~{res.dias_a_critico} días)")
 
 with col2:
     st.subheader("Historial de Mediciones")
-    df = cargar_historial(limit=300)
-    st.dataframe(df, width="stretch")
+    df = cargar_historial(limit=500)
+
+    if not df.empty:
+        df_hist = df.copy()
+        rename_cols = {
+            "id": "id",
+            "fecha": "fecha",
+            "semana_medicion": "semana",
+            "semana_label": "semana_label",
+            "equipo": "equipo",
+            "componente": "componente",
+            "ubicacion": "ubicación",
+            "usuario": "usuario",
+            "horometro": "horómetro",
+            "mm": "mm",
+            "mm_izq": "mm_izq",
+            "mm_der": "mm_der",
+            "mm_usada": "mm_usada",
+            "condicion_pct": "desgaste_pct",
+            "estado": "estado",
+            "tasa_mm_h": "tasa_mm_h",
+            "horas_a_critico": "horas_a_crítico",
+            "dias_a_critico": "días_a_crítico",
+        }
+        df_hist = df_hist.rename(columns=rename_cols)
+        st.dataframe(df_hist, width="stretch")
+    else:
+        st.info("Sin mediciones aún.")
+
+    st.divider()
+
+    # Equipos críticos y en amenaza
+    st.subheader("Equipos críticos y en amenaza")
+
+    if not df.empty:
+        ultimos = ultimos_estados_por_equipo(df)
+
+        criticos = ultimos[ultimos["estado"] == "CRÍTICO"].copy()
+        amenaza = ultimos[ultimos["estado"] == "MEDIO"].copy()
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.markdown("### 🔴 Críticos")
+            if criticos.empty:
+                st.success("Sin equipos críticos")
+            else:
+                st.dataframe(
+                    criticos[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]],
+                    width="stretch"
+                )
+
+        with c2:
+            st.markdown("### 🟡 En amenaza")
+            if amenaza.empty:
+                st.success("Sin equipos en amenaza")
+            else:
+                st.dataframe(
+                    amenaza[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]],
+                    width="stretch"
+                )
+    else:
+        st.info("No hay datos para criticidad.")
+
+# ------------------------------
+# Reporte semanal y administración
+# ------------------------------
+st.divider()
+st.subheader("Reporte semanal")
+
+df_all = cargar_historial(limit=5000)
+semana_actual, semana_label_actual, ini_sem, fin_sem = calcular_semana_medicion(datetime.now())
+
+if not df_all.empty and "semana_medicion" in df_all.columns:
+    semanas_disponibles = sorted(df_all["semana_medicion"].dropna().astype(int).unique().tolist(), reverse=True)
+    semana_sel = st.selectbox("Semana a reportar", semanas_disponibles, index=0 if semanas_disponibles else None)
+    df_sem = df_all[df_all["semana_medicion"] == semana_sel].copy()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Mediciones semana", len(df_sem))
+    with c2:
+        st.metric("Equipos medidos", df_sem["equipo"].nunique())
+    with c3:
+        ult_sem = ultimos_estados_por_equipo(df_sem)
+        st.metric("Críticos semana", int((ult_sem["estado"] == "CRÍTICO").sum()) if not ult_sem.empty else 0)
+
+    st.download_button(
+        "Descargar reporte semanal CSV",
+        data=generar_csv_bytes(df_sem),
+        file_name=f"reporte_semana_{semana_sel}.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("Aún no hay datos suficientes para reporte semanal.")
+
+# ------------------------------
+# Descarga BD y borrado admin
+# ------------------------------
+st.divider()
+st.subheader("Administración de datos")
+
+if admin_ok:
+    with open(DB_PATH, "rb") as f:
+        db_bytes = f.read()
+
+    st.download_button(
+        "Descargar base de datos SQLite",
+        data=db_bytes,
+        file_name="mediciones.db",
+        mime="application/octet-stream"
+    )
+
+    df_del = cargar_historial(limit=500)
+    if not df_del.empty and "id" in df_del.columns:
+        opciones = [
+            f"{int(r['id'])} | {r['fecha']} | Eq {r['equipo']} | {r['estado']}"
+            for _, r in df_del.iterrows()
+        ]
+        seleccion = st.multiselect("Selecciona mediciones a eliminar", opciones)
+
+        if st.button("Eliminar mediciones seleccionadas"):
+            ids = [int(x.split("|")[0].strip()) for x in seleccion]
+            borradas = eliminar_mediciones(ids)
+            st.success(f"Se eliminaron {borradas} mediciones.")
+            st.rerun()
+else:
+    st.info("La descarga de base y eliminación de mediciones quedan solo para administrador.")
+
+# ------------------------------
+# Nota sobre correo automático
+# ------------------------------
+st.caption(
+    "Nota: el envío automático de correo todos los miércoles requiere un programador externo "
+    "(Power Automate, GitHub Actions o similar). La app ya deja listo el reporte semanal descargable."
+)
