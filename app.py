@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -61,6 +60,7 @@ def inject_teck_style():
             font-weight: 800 !important;
             border: 1px solid rgba(0,160,74,.35) !important;
         }}
+
         div.stButton > button[kind="primary"] {{
             background: linear-gradient(180deg, {TECK_GREEN_2} 0%, {TECK_GREEN} 100%) !important;
         }}
@@ -112,8 +112,7 @@ EQUIPOS = [
 
 EQUIPOS_MOTONIVELADORA = {"301", "302", "303"}
 
-# Semana de medición 7x7:
-# Semana 10 = desde 2026-03-05 hasta 2026-03-11
+# Semana 10: del 5 al 11 de marzo de 2026
 REF_WEEK_START = date(2026, 3, 5)
 REF_WEEK_NUMBER = 10
 
@@ -280,15 +279,6 @@ def tabla_info(tabla: str) -> list[dict]:
     ]
 
 
-def valor_default_por_tipo(sql_type: str):
-    t = (sql_type or "").upper()
-    if "INT" in t:
-        return 0
-    if "REAL" in t or "FLOA" in t or "DOUB" in t or "NUM" in t or "DEC" in t:
-        return 0.0
-    return ""
-
-
 def guardar_medicion(
     equipo: str,
     ubicacion: Optional[str],
@@ -304,60 +294,45 @@ def guardar_medicion(
     horas_a_critico: Optional[float],
     dias_a_critico: Optional[float],
 ):
-    info = tabla_info("mediciones")
     now = datetime.now()
     semana, semana_label, inicio_sem, fin_sem = calcular_semana_medicion(now)
 
-    base = {
-        "fecha": now.isoformat(timespec="seconds"),
-        "equipo": equipo,
-        "ubicacion": (ubicacion or "").strip() or None,
-        "usuario": (usuario or "").strip() or None,
-        "componente": "Cuchilla",
-        "mm": float(mm_usada),
-
-        "horometro": float(horometro),
-        "mm_izq": float(mm_izq),
-        "mm_der": float(mm_der),
-        "mm_usada": float(mm_usada),
-
-        "condicion_pct": float(desgaste_pct),
-        "estado": estado,
-        "accion": accion,
-
-        "tasa_mm_h": float(tasa_mm_h) if tasa_mm_h is not None else None,
-        "horas_a_critico": float(horas_a_critico) if horas_a_critico is not None else None,
-        "dias_a_critico": float(dias_a_critico) if dias_a_critico is not None else None,
-
-        "semana_medicion": int(semana),
-        "semana_label": semana_label,
-        "inicio_semana": inicio_sem.isoformat(),
-        "fin_semana": fin_sem.isoformat(),
-    }
-
-    columnas = []
-    valores = []
-
-    for col in info:
-        name = col["name"]
-        if name == "id":
-            continue
-
-        val = base.get(name, None)
-        if (val is None) and col["notnull"] and (col["dflt"] is None):
-            val = valor_default_por_tipo(col["type"])
-
-        columnas.append(name)
-        valores.append(val)
-
-    placeholders = ", ".join(["?"] * len(columnas))
-    cols_sql = ", ".join(columnas)
-
     with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            f"INSERT INTO mediciones ({cols_sql}) VALUES ({placeholders})",
-            tuple(valores)
-        )
+        con.execute("""
+            INSERT INTO mediciones (
+                fecha, equipo, ubicacion, usuario, componente, mm,
+                horometro, mm_izq, mm_der, mm_usada,
+                condicion_pct, estado, accion,
+                tasa_mm_h, horas_a_critico, dias_a_critico,
+                semana_medicion, semana_label, inicio_semana, fin_semana
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now.isoformat(timespec="seconds"),
+            equipo,
+            (ubicacion or "").strip() or None,
+            (usuario or "").strip() or None,
+            "Cuchilla",
+            float(mm_usada),
+
+            float(horometro),
+            float(mm_izq),
+            float(mm_der),
+            float(mm_usada),
+
+            float(desgaste_pct),
+            estado,
+            accion,
+
+            float(tasa_mm_h) if tasa_mm_h is not None else None,
+            float(horas_a_critico) if horas_a_critico is not None else None,
+            float(dias_a_critico) if dias_a_critico is not None else None,
+
+            int(semana),
+            semana_label,
+            inicio_sem.isoformat(),
+            fin_sem.isoformat(),
+        ))
         con.commit()
 
 
@@ -366,16 +341,25 @@ def cargar_historial(limit: int = 500) -> pd.DataFrame:
     cols = [c["name"] for c in info if c["name"] != "id"]
 
     preferidas = [
-        "id", "fecha", "semana_medicion", "semana_label",
+        "fecha", "semana_medicion", "semana_label",
         "equipo", "componente", "ubicacion", "usuario",
         "horometro", "mm", "mm_izq", "mm_der", "mm_usada",
-        "condicion_pct", "estado", "tasa_mm_h", "horas_a_critico", "dias_a_critico",
+        "condicion_pct", "estado", "tasa_mm_h",
+        "horas_a_critico", "dias_a_critico", "accion"
     ]
-    ordenadas = [c for c in preferidas if c in cols] + [c for c in cols if c not in preferidas]
+
+    ordenadas = []
+    usadas = set()
+
+    for c in preferidas + cols:
+        if c in cols and c not in usadas:
+            ordenadas.append(c)
+            usadas.add(c)
+
     select_cols = ", ".join(ordenadas)
 
     with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             f"""
             SELECT {select_cols}
             FROM mediciones
@@ -384,6 +368,9 @@ def cargar_historial(limit: int = 500) -> pd.DataFrame:
             """,
             con
         )
+
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
 
 
 def obtener_ultimas_mediciones_equipo(equipo: str, n: int = N_TASA) -> list[dict]:
@@ -408,7 +395,7 @@ def eliminar_mediciones(ids: list[int]) -> int:
         return 0
     with sqlite3.connect(DB_PATH) as con:
         cur = con.cursor()
-        cur.executemany("DELETE FROM mediciones WHERE id = ?", [(int(i),) for i in ids])
+        cur.executemany("DELETE FROM mediciones WHERE rowid = ?", [(int(i),) for i in ids])
         con.commit()
         return cur.rowcount
 
@@ -540,9 +527,6 @@ init_db()
 migrar_db_agregar_columnas()
 render_header()
 
-# ------------------------------
-# Sidebar admin
-# ------------------------------
 with st.sidebar:
     st.subheader("Administración")
 
@@ -553,11 +537,8 @@ with st.sidebar:
         if admin_ok:
             st.success("Modo administrador activo")
     else:
-        st.info("Para eliminar mediciones, define ADMIN_PASSWORD en Secrets de Streamlit.")
+        st.info("Para eliminar mediciones, define ADMIN_PASSWORD en Secrets.")
 
-# ------------------------------
-# Layout principal
-# ------------------------------
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
@@ -623,10 +604,7 @@ with col1:
             st.write("Acción recomendada:", res.accion)
 
             if res.tasa_mm_h is None:
-                st.info(
-                    f"Tasa mm/h: sin datos suficientes. "
-                    f"Promedio últimas {N_TASA} mediciones por equipo."
-                )
+                st.info(f"Tasa mm/h: sin datos suficientes. Promedio últimas {N_TASA} mediciones por equipo.")
             else:
                 st.info(f"Tasa estimada (promedio): {res.tasa_mm_h} mm/h")
 
@@ -642,7 +620,6 @@ with col2:
     if not df.empty:
         df_hist = df.copy()
         rename_cols = {
-            "id": "id",
             "fecha": "fecha",
             "semana_medicion": "semana",
             "semana_label": "semana_label",
@@ -660,15 +637,15 @@ with col2:
             "tasa_mm_h": "tasa_mm_h",
             "horas_a_critico": "horas_a_crítico",
             "dias_a_critico": "días_a_crítico",
+            "accion": "acción",
         }
         df_hist = df_hist.rename(columns=rename_cols)
+        df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
         st.dataframe(df_hist, width="stretch")
     else:
         st.info("Sin mediciones aún.")
 
     st.divider()
-
-    # Equipos críticos y en amenaza
     st.subheader("Equipos críticos y en amenaza")
 
     if not df.empty:
@@ -685,7 +662,7 @@ with col2:
                 st.success("Sin equipos críticos")
             else:
                 st.dataframe(
-                    criticos[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]],
+                    criticos[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]].loc[:, ~criticos[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]].columns.duplicated()],
                     width="stretch"
                 )
 
@@ -695,21 +672,16 @@ with col2:
                 st.success("Sin equipos en amenaza")
             else:
                 st.dataframe(
-                    amenaza[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]],
+                    amenaza[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]].loc[:, ~amenaza[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]].columns.duplicated()],
                     width="stretch"
                 )
     else:
         st.info("No hay datos para criticidad.")
 
-# ------------------------------
-# Reporte semanal y administración
-# ------------------------------
 st.divider()
 st.subheader("Reporte semanal")
 
 df_all = cargar_historial(limit=5000)
-semana_actual, semana_label_actual, ini_sem, fin_sem = calcular_semana_medicion(datetime.now())
-
 if not df_all.empty and "semana_medicion" in df_all.columns:
     semanas_disponibles = sorted(df_all["semana_medicion"].dropna().astype(int).unique().tolist(), reverse=True)
     semana_sel = st.selectbox("Semana a reportar", semanas_disponibles, index=0 if semanas_disponibles else None)
@@ -733,9 +705,6 @@ if not df_all.empty and "semana_medicion" in df_all.columns:
 else:
     st.info("Aún no hay datos suficientes para reporte semanal.")
 
-# ------------------------------
-# Descarga BD y borrado admin
-# ------------------------------
 st.divider()
 st.subheader("Administración de datos")
 
@@ -751,9 +720,12 @@ if admin_ok:
     )
 
     df_del = cargar_historial(limit=500)
-    if not df_del.empty and "id" in df_del.columns:
+    if not df_del.empty:
+        df_del = df_del.reset_index(drop=True)
+        df_del["del_id"] = df_del.index + 1
+
         opciones = [
-            f"{int(r['id'])} | {r['fecha']} | Eq {r['equipo']} | {r['estado']}"
+            f"{int(r['del_id'])} | {r['fecha']} | Eq {r['equipo']} | {r['estado']}"
             for _, r in df_del.iterrows()
         ]
         seleccion = st.multiselect("Selecciona mediciones a eliminar", opciones)
@@ -766,9 +738,6 @@ if admin_ok:
 else:
     st.info("La descarga de base y eliminación de mediciones quedan solo para administrador.")
 
-# ------------------------------
-# Nota sobre correo automático
-# ------------------------------
 st.caption(
     "Nota: el envío automático de correo todos los miércoles requiere un programador externo "
     "(Power Automate, GitHub Actions o similar). La app ya deja listo el reporte semanal descargable."
