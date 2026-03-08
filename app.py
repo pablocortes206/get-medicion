@@ -113,6 +113,7 @@ EQUIPOS = [
 
 EQUIPOS_MOTONIVELADORA = {"301", "302", "303"}
 
+# Semana 10 = desde 2026-03-05 a 2026-03-11
 REF_WEEK_START = date(2026, 3, 5)
 REF_WEEK_NUMBER = 10
 
@@ -140,12 +141,18 @@ REGLAS: Dict[str, dict] = {
         "label_pct": "Desgaste (%)",
     },
     "DOZER_854_D10_D11": {
+        # Nuevo criterio solicitado
+        # 170 mm = 0% desgaste
+        # 140 mm = normal
+        # 141 a 100 = monitoreo
+        # 100 a 83 = programar cambio
+        # 82 a 75 = detención inmediata
         "puntos": [
             (75, 100),
             (82, 95),
             (83, 90),
             (100, 75),
-            (141, 45),
+            (140, 45),
             (170, 0),
         ],
         "umbrales": [
@@ -402,6 +409,7 @@ def eliminar_registros_prueba() -> int:
                    'prueba', 'test', 'demo', 'usuario prueba',
                    'pajarraco medidor', 'cristian olivares'
                )
+               OR semana_medicion IS NULL
         """)
         con.commit()
         return cur.rowcount
@@ -507,7 +515,7 @@ def evaluar(equipo: str, horometro: float, mm_izq: float, mm_der: float) -> Resu
 
 
 # ==============================
-# REPORTES
+# REPORTES / KPI
 # ==============================
 
 def ultimos_estados_por_equipo(df: pd.DataFrame) -> pd.DataFrame:
@@ -524,6 +532,28 @@ def generar_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="ReporteSemanal")
     return output.getvalue()
+
+
+def generar_resumen_mail(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "Sin datos para el reporte semanal."
+
+    estado_counts = df["estado"].value_counts()
+    ok = int(estado_counts.get("OK", 0))
+    monitoreo = int(estado_counts.get("MEDIO", 0))
+    programar = int(estado_counts.get("ALTO", 0))
+    critico = int(estado_counts.get("CRÍTICO", 0))
+
+    resumen = f"""
+Reporte semanal GET Wear Monitor
+
+Estado de flota:
+OK: {ok}
+Monitoreo: {monitoreo}
+Programar cambio: {programar}
+Crítico: {critico}
+"""
+    return resumen.strip()
 
 
 # ==============================
@@ -666,36 +696,114 @@ with col2:
     else:
         st.info("No hay datos para criticidad.")
 
+
+# ==============================
+# MEJORA 1: ESTADO DE FLOTA
+# ==============================
+
+st.divider()
+st.subheader("Estado de flota")
+
+df_flot = cargar_historial(limit=5000)
+ultimos_flot = ultimos_estados_por_equipo(df_flot) if not df_flot.empty else pd.DataFrame()
+
+if not ultimos_flot.empty:
+    estado_counts = ultimos_flot["estado"].value_counts()
+    ok = int(estado_counts.get("OK", 0))
+    monitoreo = int(estado_counts.get("MEDIO", 0))
+    programar = int(estado_counts.get("ALTO", 0))
+    critico = int(estado_counts.get("CRÍTICO", 0))
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("🟢 OK", ok)
+    k2.metric("🟡 Monitoreo", monitoreo)
+    k3.metric("🟠 Programar cambio", programar)
+    k4.metric("🔴 Crítico", critico)
+else:
+    st.info("Sin datos para estado de flota.")
+
+
+# ==============================
+# MEJORA 2: RANKING DE DESGASTE
+# ==============================
+
+st.divider()
+st.subheader("Ranking de desgaste por equipo")
+
+if not ultimos_flot.empty and "condicion_pct" in ultimos_flot.columns:
+    ranking = ultimos_flot[["equipo", "condicion_pct"]].copy()
+    ranking = ranking.sort_values("condicion_pct", ascending=False)
+    ranking = ranking.rename(columns={"condicion_pct": "desgaste_pct"})
+    st.bar_chart(ranking.set_index("equipo"))
+    st.dataframe(ranking, width="stretch")
+else:
+    st.info("Sin datos para ranking de desgaste.")
+
+
+# ==============================
+# MEJORA 3: PROYECCIÓN DE CAMBIO
+# ==============================
+
+st.divider()
+st.subheader("Proyección de cambio")
+
+if not ultimos_flot.empty:
+    cols_proj = [c for c in ["equipo", "mm_usada", "estado", "tasa_mm_h", "horas_a_critico", "dias_a_critico"] if c in ultimos_flot.columns]
+    proy = ultimos_flot[cols_proj].copy()
+    if "horas_a_critico" in proy.columns:
+        proy = proy.sort_values("horas_a_critico", na_position="last")
+    st.dataframe(proy, width="stretch")
+else:
+    st.info("Sin datos para proyección.")
+
+
+# ==============================
+# REPORTE SEMANAL
+# ==============================
+
 st.divider()
 st.subheader("Reporte semanal")
 
 df_all = cargar_historial(limit=5000)
 if not df_all.empty and "semana_medicion" in df_all.columns:
-    semanas_disponibles = sorted(df_all["semana_medicion"].dropna().astype(int).unique().tolist(), reverse=True)
-    semana_sel = st.selectbox("Semana a reportar", semanas_disponibles, index=0 if semanas_disponibles else None)
+    semanas_validas = df_all["semana_medicion"].dropna()
+    semanas_disponibles = sorted(semanas_validas.astype(int).unique().tolist(), reverse=True)
 
-    equipos_disp = ["TODOS"] + sorted(df_all["equipo"].dropna().astype(str).unique().tolist())
-    equipo_sel = st.selectbox("Equipo a reportar", equipos_disp, index=0)
+    if semanas_disponibles:
+        semana_sel = st.selectbox("Semana a reportar", semanas_disponibles, index=0)
 
-    df_sem = df_all[df_all["semana_medicion"] == semana_sel].copy()
-    if equipo_sel != "TODOS":
-        df_sem = df_sem[df_sem["equipo"].astype(str) == equipo_sel].copy()
+        equipos_disp = ["TODOS"] + sorted(df_all["equipo"].dropna().astype(str).unique().tolist())
+        equipo_sel = st.selectbox("Equipo a reportar", equipos_disp, index=0)
 
-    df_reporte = df_sem.copy()
-    df_reporte["criticidad"] = df_reporte["condicion_pct"]
+        df_sem = df_all[df_all["semana_medicion"] == semana_sel].copy()
+        if equipo_sel != "TODOS":
+            df_sem = df_sem[df_sem["equipo"].astype(str) == equipo_sel].copy()
 
-    columnas_reporte = ["equipo", "semana_medicion", "usuario", "horometro", "criticidad", "estado"]
-    columnas_reporte = [c for c in columnas_reporte if c in df_reporte.columns]
-    df_reporte = df_reporte[columnas_reporte]
+        df_reporte = df_sem.copy()
+        df_reporte["criticidad"] = df_reporte["condicion_pct"]
 
-    st.download_button(
-        "Descargar reporte semanal Excel",
-        data=generar_excel_bytes(df_reporte),
-        file_name=f"reporte_semana_{semana_sel}_{equipo_sel}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        columnas_reporte = ["equipo", "semana_medicion", "usuario", "horometro", "criticidad", "estado"]
+        columnas_reporte = [c for c in columnas_reporte if c in df_reporte.columns]
+        df_reporte = df_reporte[columnas_reporte]
+
+        st.download_button(
+            "Descargar reporte semanal Excel",
+            data=generar_excel_bytes(df_reporte),
+            file_name=f"reporte_semana_{semana_sel}_{equipo_sel}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        resumen_mail = generar_resumen_mail(ultimos_estados_por_equipo(df_sem))
+        st.text_area("Resumen para correo semanal", value=resumen_mail, height=150)
+    else:
+        st.info("No hay semanas válidas para reportar.")
 else:
     st.info("Aún no hay datos suficientes para reporte semanal.")
+
+
+# ==============================
+# ADMINISTRACIÓN
+# ==============================
 
 st.divider()
 st.subheader("Administración de datos")
@@ -735,6 +843,5 @@ else:
     st.info("La descarga de base y eliminación de mediciones quedan solo para administrador.")
 
 st.caption(
-    "Nota: el envío automático de correo todos los miércoles requiere un programador externo "
-    "(Power Automate, GitHub Actions o similar)."
+    "Nota: el envío automático de correo todos los miércoles requiere Power Automate o un programador externo."
 )
