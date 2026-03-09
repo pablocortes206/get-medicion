@@ -113,7 +113,6 @@ EQUIPOS = [
 
 EQUIPOS_MOTONIVELADORA = {"301", "302", "303"}
 
-# Semana 10 = desde 2026-03-05 a 2026-03-11
 REF_WEEK_START = date(2026, 3, 5)
 REF_WEEK_NUMBER = 10
 
@@ -141,12 +140,6 @@ REGLAS: Dict[str, dict] = {
         "label_pct": "Desgaste (%)",
     },
     "DOZER_854_D10_D11": {
-        # Nuevo criterio solicitado
-        # 170 mm = 0% desgaste
-        # 140 mm = normal
-        # 141 a 100 = monitoreo
-        # 100 a 83 = programar cambio
-        # 82 a 75 = detención inmediata
         "puntos": [
             (75, 100),
             (82, 95),
@@ -659,7 +652,37 @@ with col2:
     if not df.empty:
         df_hist = df.copy()
         df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
-        st.dataframe(df_hist, width="stretch")
+
+        if admin_ok and "id" in df_hist.columns:
+            df_sel = df_hist.copy()
+            df_sel.insert(0, "eliminar", False)
+
+            edited_df = st.data_editor(
+                df_sel,
+                width="stretch",
+                hide_index=True,
+                disabled=[c for c in df_sel.columns if c != "eliminar"],
+                column_config={
+                    "eliminar": st.column_config.CheckboxColumn(
+                        "Eliminar",
+                        help="Marca las filas que quieres borrar"
+                    )
+                },
+                key="editor_historial"
+            )
+
+            filas_a_borrar = edited_df[edited_df["eliminar"] == True]
+
+            if len(filas_a_borrar) > 0:
+                st.warning(f"Has seleccionado {len(filas_a_borrar)} registro(s) para eliminar.")
+
+                if st.button("Eliminar filas seleccionadas", type="primary"):
+                    ids_borrar = filas_a_borrar["id"].astype(int).tolist()
+                    borradas = eliminar_mediciones_por_ids(ids_borrar)
+                    st.success(f"Se eliminaron {borradas} medición(es).")
+                    st.rerun()
+        else:
+            st.dataframe(df_hist, width="stretch")
     else:
         st.info("Sin mediciones aún.")
 
@@ -696,11 +719,6 @@ with col2:
     else:
         st.info("No hay datos para criticidad.")
 
-
-# ==============================
-# MEJORA 1: ESTADO DE FLOTA
-# ==============================
-
 st.divider()
 st.subheader("Estado de flota")
 
@@ -722,11 +740,6 @@ if not ultimos_flot.empty:
 else:
     st.info("Sin datos para estado de flota.")
 
-
-# ==============================
-# MEJORA 2: RANKING DE DESGASTE
-# ==============================
-
 st.divider()
 st.subheader("Ranking de desgaste por equipo")
 
@@ -739,11 +752,6 @@ if not ultimos_flot.empty and "condicion_pct" in ultimos_flot.columns:
 else:
     st.info("Sin datos para ranking de desgaste.")
 
-
-# ==============================
-# MEJORA 3: PROYECCIÓN DE CAMBIO
-# ==============================
-
 st.divider()
 st.subheader("Proyección de cambio")
 
@@ -755,11 +763,6 @@ if not ultimos_flot.empty:
     st.dataframe(proy, width="stretch")
 else:
     st.info("Sin datos para proyección.")
-
-
-# ==============================
-# REPORTE SEMANAL
-# ==============================
 
 st.divider()
 st.subheader("Reporte semanal")
@@ -800,11 +803,6 @@ if not df_all.empty and "semana_medicion" in df_all.columns:
 else:
     st.info("Aún no hay datos suficientes para reporte semanal.")
 
-
-# ==============================
-# ADMINISTRACIÓN
-# ==============================
-
 st.divider()
 st.subheader("Administración de datos")
 
@@ -824,21 +822,6 @@ if admin_ok:
         borradas_prueba = eliminar_registros_prueba()
         st.success(f"Se eliminaron {borradas_prueba} registros de prueba.")
         st.rerun()
-
-    st.markdown("### Eliminar mediciones seleccionadas")
-    df_del = cargar_historial(limit=500)
-    if not df_del.empty and "id" in df_del.columns:
-        opciones = [
-            f"{int(r['id'])} | {r['fecha']} | Eq {r['equipo']} | {r['estado']}"
-            for _, r in df_del.iterrows()
-        ]
-        seleccion = st.multiselect("Selecciona mediciones a eliminar", opciones)
-
-        if st.button("Eliminar mediciones seleccionadas"):
-            ids = [int(x.split("|")[0].strip()) for x in seleccion]
-            borradas = eliminar_mediciones_por_ids(ids)
-            st.success(f"Se eliminaron {borradas} mediciones.")
-            st.rerun()
 else:
     st.info("La descarga de base y eliminación de mediciones quedan solo para administrador.")
 
