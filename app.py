@@ -113,6 +113,8 @@ EQUIPOS = [
 
 EQUIPOS_MOTONIVELADORA = {"301", "302", "303"}
 
+# Semana base:
+# 5 al 11 de marzo = Semana 10
 REF_WEEK_START = date(2026, 3, 5)
 REF_WEEK_NUMBER = 10
 
@@ -140,6 +142,10 @@ REGLAS: Dict[str, dict] = {
         "label_pct": "Desgaste (%)",
     },
     "DOZER_854_D10_D11": {
+        # 170 mm = 0% desgaste = normal
+        # 141 a 100 = monitoreo
+        # 100 a 83 = programar cambio
+        # 82 a 75 = detención inmediata
         "puntos": [
             (75, 100),
             (82, 95),
@@ -266,15 +272,6 @@ def migrar_db_agregar_columnas():
         con.commit()
 
 
-def tabla_info(tabla: str) -> list[dict]:
-    with sqlite3.connect(DB_PATH) as con:
-        rows = con.execute(f"PRAGMA table_info({tabla})").fetchall()
-    return [
-        {"name": r[1], "type": (r[2] or "").upper(), "notnull": bool(r[3]), "dflt": r[4]}
-        for r in rows
-    ]
-
-
 def guardar_medicion(
     equipo: str,
     ubicacion: Optional[str],
@@ -329,31 +326,27 @@ def guardar_medicion(
 
 
 def cargar_historial(limit: int = 500) -> pd.DataFrame:
-    info = tabla_info("mediciones")
-    cols = [c["name"] for c in info if c["name"] != "id"]
-
-    preferidas = [
-        "id", "fecha", "semana_medicion", "semana_label",
-        "equipo", "componente", "ubicacion", "usuario",
-        "horometro", "mm", "mm_izq", "mm_der", "mm_usada",
-        "condicion_pct", "estado", "tasa_mm_h",
-        "horas_a_critico", "dias_a_critico", "accion"
-    ]
-
-    ordenadas = []
-    usadas = set()
-    for c in preferidas + cols:
-        if c in cols and c not in usadas:
-            ordenadas.append(c)
-            usadas.add(c)
-
-    select_cols = ", ".join(ordenadas)
-
     with sqlite3.connect(DB_PATH) as con:
         df = pd.read_sql_query(
             f"""
-            SELECT {select_cols}
+            SELECT
+                id,
+                fecha,
+                semana_medicion,
+                semana_label,
+                equipo,
+                componente,
+                ubicacion,
+                usuario,
+                horometro,
+                mm_usada,
+                condicion_pct,
+                estado,
+                tasa_mm_h,
+                horas_a_critico,
+                dias_a_critico
             FROM mediciones
+            WHERE semana_medicion IS NOT NULL
             ORDER BY datetime(fecha) DESC
             LIMIT {int(limit)}
             """,
@@ -651,8 +644,6 @@ with col2:
 
     if not df.empty:
         df_hist = df.copy()
-        df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
-
         st.dataframe(df_hist, width="stretch")
 
         if admin_ok and "id" in df_hist.columns:
@@ -664,17 +655,18 @@ with col2:
                 axis=1
             )
 
-            seleccion = st.multiselect(
-                "Selecciona registros a eliminar",
-                options=df_delete["descripcion"].tolist()
+            seleccion = st.selectbox(
+                "Seleccionar registro a eliminar",
+                options=[""] + df_delete["descripcion"].tolist(),
+                index=0
             )
 
-            if len(seleccion) > 0:
-                ids_borrar = df_delete[df_delete["descripcion"].isin(seleccion)]["id"].astype(int).tolist()
-                st.warning(f"Se eliminarán {len(ids_borrar)} registro(s).")
+            if seleccion:
+                id_borrar = int(seleccion.split("|")[0].replace("ID", "").strip())
+                st.warning("Se eliminará el registro seleccionado.")
 
-                if st.button("Eliminar registros seleccionados", type="primary"):
-                    borradas = eliminar_mediciones_por_ids(ids_borrar)
+                if st.button("Eliminar registro seleccionado", type="primary"):
+                    borradas = eliminar_mediciones_por_ids([id_borrar])
                     st.success(f"Se eliminaron {borradas} medición(es).")
                     st.rerun()
     else:
