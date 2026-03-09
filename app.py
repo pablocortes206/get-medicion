@@ -653,71 +653,33 @@ with col2:
         df_hist = df.copy()
         df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
 
-        if admin_ok and "id" in df_hist.columns:
-            df_sel = df_hist.copy()
-            df_sel.insert(0, "eliminar", False)
+        st.dataframe(df_hist, width="stretch")
 
-            edited_df = st.data_editor(
-                df_sel,
-                width="stretch",
-                hide_index=True,
-                disabled=[c for c in df_sel.columns if c != "eliminar"],
-                column_config={
-                    "eliminar": st.column_config.CheckboxColumn(
-                        "Eliminar",
-                        help="Marca las filas que quieres borrar"
-                    )
-                },
-                key="editor_historial"
+        if admin_ok and "id" in df_hist.columns:
+            st.markdown("### Eliminar registros del historial")
+
+            df_delete = df_hist[["id", "fecha", "equipo", "usuario", "estado"]].copy()
+            df_delete["descripcion"] = df_delete.apply(
+                lambda r: f"ID {int(r['id'])} | {r['fecha']} | Eq {r['equipo']} | {r['usuario']} | {r['estado']}",
+                axis=1
             )
 
-            filas_a_borrar = edited_df[edited_df["eliminar"] == True]
+            seleccion = st.multiselect(
+                "Selecciona registros a eliminar",
+                options=df_delete["descripcion"].tolist()
+            )
 
-            if len(filas_a_borrar) > 0:
-                st.warning(f"Has seleccionado {len(filas_a_borrar)} registro(s) para eliminar.")
+            if len(seleccion) > 0:
+                ids_borrar = df_delete[df_delete["descripcion"].isin(seleccion)]["id"].astype(int).tolist()
+                st.warning(f"Se eliminarán {len(ids_borrar)} registro(s).")
 
-                if st.button("Eliminar filas seleccionadas", type="primary"):
-                    ids_borrar = filas_a_borrar["id"].astype(int).tolist()
+                if st.button("Eliminar registros seleccionados", type="primary"):
                     borradas = eliminar_mediciones_por_ids(ids_borrar)
                     st.success(f"Se eliminaron {borradas} medición(es).")
                     st.rerun()
-        else:
-            st.dataframe(df_hist, width="stretch")
     else:
         st.info("Sin mediciones aún.")
 
-    st.divider()
-    st.subheader("Equipos críticos y en amenaza")
-
-    if not df.empty:
-        ultimos = ultimos_estados_por_equipo(df)
-
-        criticos = ultimos[ultimos["estado"] == "CRÍTICO"].copy()
-        amenaza = ultimos[ultimos["estado"].isin(["ALTO", "MEDIO"])].copy()
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.markdown("### 🔴 Críticos")
-            if criticos.empty:
-                st.success("Sin equipos críticos")
-            else:
-                st.dataframe(
-                    criticos[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]],
-                    width="stretch"
-                )
-
-        with c2:
-            st.markdown("### 🟡 En amenaza")
-            if amenaza.empty:
-                st.success("Sin equipos en amenaza")
-            else:
-                st.dataframe(
-                    amenaza[["equipo", "semana_medicion", "mm_usada", "condicion_pct", "estado", "horas_a_critico", "dias_a_critico"]],
-                    width="stretch"
-                )
-    else:
-        st.info("No hay datos para criticidad.")
 
 st.divider()
 st.subheader("Estado de flota")
@@ -740,6 +702,7 @@ if not ultimos_flot.empty:
 else:
     st.info("Sin datos para estado de flota.")
 
+
 st.divider()
 st.subheader("Ranking de desgaste por equipo")
 
@@ -752,6 +715,7 @@ if not ultimos_flot.empty and "condicion_pct" in ultimos_flot.columns:
 else:
     st.info("Sin datos para ranking de desgaste.")
 
+
 st.divider()
 st.subheader("Proyección de cambio")
 
@@ -763,6 +727,7 @@ if not ultimos_flot.empty:
     st.dataframe(proy, width="stretch")
 else:
     st.info("Sin datos para proyección.")
+
 
 st.divider()
 st.subheader("Reporte semanal")
@@ -802,6 +767,7 @@ if not df_all.empty and "semana_medicion" in df_all.columns:
         st.info("No hay semanas válidas para reportar.")
 else:
     st.info("Aún no hay datos suficientes para reporte semanal.")
+
 
 st.divider()
 st.subheader("Administración de datos")
