@@ -17,8 +17,7 @@ from supabase import create_client, Client
 # =========================================================
 # CONFIG
 # =========================================================
-st.set_page_config(page_title="GET Wear Monitor", layout="wide")
-
+st.set_page_config(page_title="GET Wear Monitor v2", layout="wide")
 TECK_GREEN   = "#007A3D"
 TECK_GREEN_2 = "#00A04A"
 TECK_DARK    = "#0B0F14"
