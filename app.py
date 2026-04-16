@@ -17,6 +17,7 @@ def get_supabase():
     return create_client(url, key)
 
 supabase = get_supabase()
+st.write("Supabase OK:", supabase is not None)
 
 # ==============================
 # ESTILO TECK
