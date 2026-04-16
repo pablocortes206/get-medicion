@@ -218,11 +218,14 @@ def guardar_horometros(df: pd.DataFrame) -> int:
 @st.cache_data(ttl=300)
 def cargar_horometros_db() -> pd.DataFrame:
     """Carga el último horómetro por equipo desde Supabase."""
-    resp = sb().table("horometros").select("*").order("fecha", desc=True).limit(500).execute()
-    df = pd.DataFrame(resp.data or [])
-    if df.empty: return df
-    df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
-    return df.sort_values("fecha_dt", ascending=False).drop_duplicates("equipo", keep="first")
+    try:
+        resp = sb().table("horometros").select("*").order("fecha", desc=True).limit(500).execute()
+        df = pd.DataFrame(resp.data or [])
+        if df.empty: return df
+        df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
+        return df.sort_values("fecha_dt", ascending=False).drop_duplicates("equipo", keep="first")
+    except Exception:
+        return pd.DataFrame()
 
 
 def tasa_por_horometro(equipo: str) -> Optional[float]:
@@ -297,13 +300,19 @@ def proyectar_con_horas_dia(mm_usada: float, h_dia: float, mm_critico: float,
 # =========================================================
 @st.cache_data(ttl=60)
 def cargar_historial(limit: int = 500) -> pd.DataFrame:
-    resp = sb().table("mediciones").select("*").order("fecha",desc=True).limit(limit).execute()
-    return pd.DataFrame(resp.data or [])
+    try:
+        resp = sb().table("mediciones").select("*").order("fecha",desc=True).limit(limit).execute()
+        return pd.DataFrame(resp.data or [])
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=60)
 def cargar_cambios(limit: int = 200) -> pd.DataFrame:
-    resp = sb().table("cambios_cuchilla").select("*").order("fecha",desc=True).limit(limit).execute()
-    return pd.DataFrame(resp.data or [])
+    try:
+        resp = sb().table("cambios_cuchilla").select("*").order("fecha",desc=True).limit(limit).execute()
+        return pd.DataFrame(resp.data or [])
+    except Exception:
+        return pd.DataFrame()
 
 def ultimo_cambio_equipo(eq: str) -> Optional[dict]:
     resp = sb().table("cambios_cuchilla").select("fecha,horometro").eq("equipo",eq).order("fecha",desc=True).limit(1).execute()
