@@ -315,15 +315,21 @@ def cargar_cambios(limit: int = 200) -> pd.DataFrame:
         return pd.DataFrame()
 
 def ultimo_cambio_equipo(eq: str) -> Optional[dict]:
-    resp = sb().table("cambios_cuchilla").select("fecha,horometro").eq("equipo",eq).order("fecha",desc=True).limit(1).execute()
-    data = resp.data or []
-    return data[0] if data else None
+    try:
+        resp = sb().table("cambios_cuchilla").select("fecha,horometro").eq("equipo",eq).order("fecha",desc=True).limit(1).execute()
+        data = resp.data or []
+        return data[0] if data else None
+    except Exception:
+        return None
 
 def ultimas_meds_equipo(eq: str, n: int = 5) -> list[dict]:
-    uc = ultimo_cambio_equipo(eq)
-    q = sb().table("mediciones").select("fecha,horometro,mm_usada").eq("equipo",eq).eq("es_cambio",False).order("fecha",desc=True).limit(n)
-    if uc: q = q.gte("fecha", uc["fecha"])
-    return q.execute().data or []
+    try:
+        uc = ultimo_cambio_equipo(eq)
+        q = sb().table("mediciones").select("fecha,horometro,mm_usada").eq("equipo",eq).eq("es_cambio",False).order("fecha",desc=True).limit(n)
+        if uc: q = q.gte("fecha", uc["fecha"])
+        return q.execute().data or []
+    except Exception:
+        return []
 
 def guardar_medicion(fecha, eq, horometro, mm_izq, mm_der, usuario, r):
     sb().table("mediciones").insert({
