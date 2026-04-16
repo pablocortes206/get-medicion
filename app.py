@@ -12,6 +12,7 @@ def get_supabase():
     return create_client(url, key)
 
 supabase = get_supabase()
+st.write("URL usada:", st.secrets["SUPABASE_URL"])
 
 st.title("GET Wear Monitor 🚜")
 
@@ -66,12 +67,12 @@ def guardar_medicion(fecha_medicion, equipo, horometro, mm_izq, mm_der, usuario)
     return supabase.table("mediciones").insert(payload).execute()
 
 def cargar_historial():
+    st.write("Probando conexión a:", st.secrets["SUPABASE_URL"])
     resp = (
         supabase
         .table("mediciones")
         .select("*")
-        .order("fecha", desc=True)
-        .limit(200)
+        .limit(5)
         .execute()
     )
     data = resp.data if resp.data else []
