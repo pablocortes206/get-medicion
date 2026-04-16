@@ -17,7 +17,8 @@ from supabase import create_client, Client
 # =========================================================
 # CONFIG
 # =========================================================
-st.set_page_config(page_title="GET Wear Monitor v2", layout="wide")
+st.set_page_config(page_title="GET Wear Monitor", layout="wide")
+
 TECK_GREEN   = "#007A3D"
 TECK_GREEN_2 = "#00A04A"
 TECK_DARK    = "#0B0F14"
@@ -314,21 +315,15 @@ def cargar_cambios(limit: int = 200) -> pd.DataFrame:
         return pd.DataFrame()
 
 def ultimo_cambio_equipo(eq: str) -> Optional[dict]:
-    try:
-        resp = sb().table("cambios_cuchilla").select("fecha,horometro").eq("equipo",eq).order("fecha",desc=True).limit(1).execute()
-        data = resp.data or []
-        return data[0] if data else None
-    except Exception:
-        return None
+    resp = sb().table("cambios_cuchilla").select("fecha,horometro").eq("equipo",eq).order("fecha",desc=True).limit(1).execute()
+    data = resp.data or []
+    return data[0] if data else None
 
 def ultimas_meds_equipo(eq: str, n: int = 5) -> list[dict]:
-    try:
-        uc = ultimo_cambio_equipo(eq)
-        q = sb().table("mediciones").select("fecha,horometro,mm_usada").eq("equipo",eq).eq("es_cambio",False).order("fecha",desc=True).limit(n)
-        if uc: q = q.gte("fecha", uc["fecha"])
-        return q.execute().data or []
-    except Exception:
-        return []
+    uc = ultimo_cambio_equipo(eq)
+    q = sb().table("mediciones").select("fecha,horometro,mm_usada").eq("equipo",eq).eq("es_cambio",False).order("fecha",desc=True).limit(n)
+    if uc: q = q.gte("fecha", uc["fecha"])
+    return q.execute().data or []
 
 def guardar_medicion(fecha, eq, horometro, mm_izq, mm_der, usuario, r):
     sb().table("mediciones").insert({
