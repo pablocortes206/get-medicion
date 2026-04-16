@@ -710,7 +710,7 @@ with tabs[3]:
             if val > 14: return "color:#ff4444;font-weight:bold"
             if val > 7:  return "color:#ff9900"
             return "color:#44ff88"
-        st.dataframe(df_dias.style.applymap(color_dias, subset=["dias_sin_medir"]), use_container_width=True)
+        st.dataframe(df_dias.style.map(color_dias, subset=["dias_sin_medir"]), use_container_width=True)
 
         st.divider()
         st.subheader("Proyección de cambios")
