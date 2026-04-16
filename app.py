@@ -719,6 +719,11 @@ with tabs[3]:
         st.dataframe(proy, use_container_width=True)
     else:
         st.info("Sin datos de flota aún.")
+        try:
+            resp = sb().table("mediciones").select("id,equipo").limit(3).execute()
+            st.write("🔌 Debug conexión:", resp.data)
+        except Exception as e:
+            st.error(f"❌ Error conexión: {e}")
 
 
 # ─────────────────────────────────────────────
