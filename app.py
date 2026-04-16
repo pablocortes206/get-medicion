@@ -530,4 +530,4 @@ with tabs[1]:
         tecnico_1 = st.text_input("Técnico 1")
         tecnico_2 = st.text_input("Técnico 2")
         observaciones = st.text_area("Observaciones")
-        usuario_cambio =_
+        usuario_cambio =
