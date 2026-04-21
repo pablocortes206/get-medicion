@@ -11,6 +11,9 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 import pandas as pd
+import subprocess
+import tempfile
+import os
 import streamlit as st
 from supabase import create_client, Client
 
@@ -30,7 +33,6 @@ EQUIPOS = [
 ]
 EQUIPOS_MOTONIVELADORA = {"301","302","303"}
 
-# Mapeo código Excel → ID interno
 CODIGO_A_ID = {
     "0174-DZ-101":"101","0174-DZ-102":"102","0174-DZ-103":"103",
     "0174-DZ-104":"104","0174-DZ-105":"105","0174-DZ-106":"106",
@@ -55,6 +57,9 @@ REGLAS: Dict[str, dict] = {
 
 COLOR_ESTADO = {"OK":"🟢","MEDIO":"🟡","ALTO":"🟠","CRÍTICO":"🔴"}
 BG_ESTADO    = {"OK":"#1a3d1a","MEDIO":"#3d3000","ALTO":"#3d1a00","CRÍTICO":"#3d0000"}
+
+# Tolerancia horómetro: si difiere más de este % del Excel, advertir
+HORO_TOLERANCIA_PCT = 5.0
 
 
 # =========================================================
@@ -103,7 +108,7 @@ def sb() -> Client:
 
 
 # =========================================================
-# LÓGICA DESGASTE
+# LÓGICA
 # =========================================================
 def regla_por_equipo(eq: str) -> str:
     return "MOTONIVELADORA" if eq in EQUIPOS_MOTONIVELADORA else "DOZER_854_D10_D11"
@@ -127,7 +132,6 @@ def clasificar(pct, umbrales):
     return "OK","Operación normal."
 
 def calcular_tasa_meds(meds: list[dict]) -> Optional[float]:
-    """Tasa desde mediciones reales (mm/h)."""
     if len(meds) < 2: return None
     tasas = []
     for i in range(len(meds)-1):
@@ -145,27 +149,22 @@ def proyectar(mm_usada: float, tasa: Optional[float], mm_critico: float):
 
 
 # =========================================================
-# LECTURA EXCEL HORÓMETROS
+# LECTURA EXCEL HORÓMETROS (con corrección de negativos)
 # =========================================================
 def leer_excel_horometros(archivo) -> pd.DataFrame:
-    """
-    Lee la hoja HOROMETRO del Excel de control.
-    Columnas esperadas: B=codigo, D=fecha, E=horometro, F=prom_7d, G=prom_30d, H=prom_hist
-    Equipos GET en filas 29-43.
-    """
     from openpyxl import load_workbook
     wb = load_workbook(archivo, read_only=True, data_only=True)
     ws = wb["HOROMETRO"]
 
     registros = []
     for row in ws.iter_rows(min_row=29, max_row=43, min_col=2, max_col=8, values_only=True):
-        codigo = row[0]  # Col B
+        codigo = row[0]
         if not codigo or not isinstance(codigo, str): continue
         codigo = codigo.strip()
         if codigo not in CODIGO_A_ID: continue
 
         equipo_id = CODIGO_A_ID[codigo]
-        fecha_act = row[2]  # Col D
+        fecha_act = row[2]
         if hasattr(fecha_act, 'date'):
             fecha_act = fecha_act.date()
         elif isinstance(fecha_act, str):
@@ -174,12 +173,24 @@ def leer_excel_horometros(archivo) -> pd.DataFrame:
         else:
             fecha_act = date.today()
 
-        horometro   = float(row[3]) if row[3] is not None else None  # Col E
-        prom_7d     = float(row[4]) if row[4] is not None else None  # Col F
-        prom_30d    = float(row[5]) if row[5] is not None else None  # Col G
-        prom_hist   = float(row[6]) if row[6] is not None else None  # Col H
+        horometro   = float(row[3]) if row[3] is not None else None
+        prom_7d     = float(row[4]) if row[4] is not None else None
+        prom_30d    = float(row[5]) if row[5] is not None else None
+        prom_hist   = float(row[6]) if row[6] is not None else None
 
         if horometro is None: continue
+
+        # ✅ CORRECCIÓN: si promedios son negativos o absurdos, recalcular
+        # usando el horómetro actual como base y el histórico como referencia
+        def corregir_promedio(val, hist_ref):
+            if val is None: return None
+            if val < 0 or val > 24:  # imposible (más de 24h/día)
+                return hist_ref if (hist_ref and 0 < hist_ref <= 24) else None
+            return val
+
+        prom_7d   = corregir_promedio(prom_7d,   prom_hist)
+        prom_30d  = corregir_promedio(prom_30d,  prom_hist)
+        prom_hist = corregir_promedio(prom_hist, None)
 
         registros.append({
             "codigo_excel": codigo,
@@ -189,6 +200,7 @@ def leer_excel_horometros(archivo) -> pd.DataFrame:
             "promedio_7d": prom_7d,
             "promedio_30d": prom_30d,
             "promedio_historico": prom_hist,
+            "tiene_error": (row[4] is not None and float(row[4]) < 0) or (row[5] is not None and float(row[5]) < 0),
         })
 
     wb.close()
@@ -196,7 +208,6 @@ def leer_excel_horometros(archivo) -> pd.DataFrame:
 
 
 def guardar_horometros(df: pd.DataFrame) -> int:
-    """Upsert en tabla horometros. Retorna cantidad procesada."""
     if df.empty: return 0
     count = 0
     for _, row in df.iterrows():
@@ -217,7 +228,6 @@ def guardar_horometros(df: pd.DataFrame) -> int:
 
 @st.cache_data(ttl=300)
 def cargar_horometros_db() -> pd.DataFrame:
-    """Carga el último horómetro por equipo desde Supabase."""
     try:
         resp = sb().table("horometros").select("*").order("fecha", desc=True).limit(500).execute()
         df = pd.DataFrame(resp.data or [])
@@ -228,75 +238,51 @@ def cargar_horometros_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def tasa_por_horometro(equipo: str) -> Optional[float]:
-    """
-    Calcula tasa mm/h usando:
-    1. Mediciones reales (prioritario)
-    2. Si no hay suficientes, usa mm_usada / horas promedio del Excel
-    """
-    return None  # se calcula en evaluar()
+def proyectar_con_horas_dia(mm_usada, h_dia, mm_critico, horometro_actual, equipo):
+    try:
+        resp = sb().table("mediciones").select("horometro,mm_usada").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=True).limit(10).execute()
+        meds_all = resp.data or []
+    except:
+        meds_all = []
+    tasa = calcular_tasa_meds(meds_all)
+    if tasa is None or tasa <= 0:
+        regla = regla_por_equipo(equipo)
+        tasa = 0.013 if regla == "DOZER_854_D10_D11" else 0.028
+    restante_mm = mm_usada - mm_critico
+    if restante_mm <= 0: return 0.0, 0.0
+    horas = restante_mm / tasa
+    dias  = horas / h_dia
+    return round(horas, 1), round(dias, 1)
 
 
-def evaluar(eq: str, horometro: float, mm_izq: float, mm_der: float) -> dict:
+def evaluar(eq, horometro, mm_izq, mm_der) -> dict:
     mm_usada = min(mm_izq, mm_der)
     regla = regla_por_equipo(eq)
     cfg = REGLAS[regla]
     pct = round(interpolar_pct(mm_usada, cfg["puntos"]), 1)
     estado, accion = clasificar(pct, cfg["umbrales"])
-
-    # Mediciones reales del ciclo actual
     hist = ultimas_meds_equipo(eq, 5)
     meds = [{"horometro": horometro, "mm_usada": mm_usada}] + hist
     tasa = calcular_tasa_meds(meds)
-
-    # Si no hay tasa desde mediciones, usar promedio de horómetros Excel
     if tasa is None:
         df_horo = cargar_horometros_db()
         if not df_horo.empty:
             row_h = df_horo[df_horo["equipo"] == eq]
             if not row_h.empty:
                 prom = row_h.iloc[0].get("promedio_30d") or row_h.iloc[0].get("promedio_historico")
-                # tasa estimada = desgaste_desde_nuevo / horas_acumuladas
-                # Usamos promedio h/día para proyectar directamente
                 if prom and prom > 0:
-                    # Guardamos el promedio para la proyección
-                    h_dia = float(prom)
-                    h_c, d_c = proyectar_con_horas_dia(mm_usada, h_dia, cfg["mm_critico"], horometro, eq)
+                    h_c, d_c = proyectar_con_horas_dia(mm_usada, float(prom), cfg["mm_critico"], horometro, eq)
                     return dict(mm_usada=mm_usada, pct=pct, estado=estado, accion=accion,
                                 tasa=None, h_critico=h_c, d_critico=d_c, regla=regla,
                                 fuente_tasa="Excel horómetros")
-
     h_c, d_c = proyectar(mm_usada, tasa, cfg["mm_critico"])
     return dict(mm_usada=mm_usada, pct=pct, estado=estado, accion=accion,
                 tasa=tasa, h_critico=h_c, d_critico=d_c, regla=regla,
                 fuente_tasa="Mediciones reales" if tasa else "Sin datos")
 
 
-def proyectar_con_horas_dia(mm_usada: float, h_dia: float, mm_critico: float,
-                             horometro_actual: float, equipo: str) -> tuple[Optional[float], Optional[float]]:
-    """
-    Proyecta usando h/día del Excel y la tasa de desgaste histórica del equipo.
-    Si no hay tasa histórica, usa tasa promedio de flota.
-    """
-    # Intentar obtener tasa desde historial completo del equipo
-    resp = sb().table("mediciones").select("horometro,mm_usada").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=True).limit(10).execute()
-    meds_all = resp.data or []
-    tasa = calcular_tasa_meds(meds_all)
-
-    if tasa is None or tasa <= 0:
-        # Tasa promedio por tipo de equipo
-        regla = regla_por_equipo(equipo)
-        tasa = 0.013 if regla == "DOZER_854_D10_D11" else 0.028  # mm/h referencial
-
-    restante_mm = mm_usada - mm_critico
-    if restante_mm <= 0: return 0.0, 0.0
-    horas = restante_mm / tasa
-    dias  = horas / h_dia  # días reales considerando uso real del equipo
-    return round(horas, 1), round(dias, 1)
-
-
 # =========================================================
-# DB MEDICIONES
+# DB
 # =========================================================
 @st.cache_data(ttl=60)
 def cargar_historial(limit: int = 500) -> pd.DataFrame:
@@ -345,6 +331,24 @@ def guardar_medicion(fecha, eq, horometro, mm_izq, mm_der, usuario, r):
     }).execute()
     cargar_historial.clear()
 
+def actualizar_medicion(id_med: int, horometro: float, mm_izq: float, mm_der: float, usuario_edit: str, eq: str):
+    """Editar una medición existente — solo admin."""
+    r = evaluar(eq, horometro, mm_izq, mm_der)
+    sb().table("mediciones").update({
+        "horometro": float(horometro),
+        "mm_izq": float(mm_izq),
+        "mm_der": float(mm_der),
+        "mm_usada": float(r["mm_usada"]),
+        "condicion_pct": float(r["pct"]),
+        "estado": r["estado"],
+        "accion": r["accion"],
+        "tasa_mm_h": float(r["tasa"]) if r.get("tasa") else None,
+        "horas_a_critico": float(r["h_critico"]) if r.get("h_critico") is not None else None,
+        "dias_a_critico": float(r["d_critico"]) if r.get("d_critico") is not None else None,
+        "usuario": usuario_edit.strip(),
+    }).eq("id", int(id_med)).execute()
+    cargar_historial.clear()
+
 def guardar_cambio(fecha, eq, horometro, mm_izq_f, mm_der_f, fue_virada, motivo, obs, tec1, tec2, usuario):
     sb().table("cambios_cuchilla").insert({
         "fecha": str(fecha), "equipo": eq, "horometro": float(horometro),
@@ -376,7 +380,7 @@ def ultimos_por_equipo(df: pd.DataFrame) -> pd.DataFrame:
 def excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False)
+        df.to_excel(w, index=False, sheet_name="Datos")
     return buf.getvalue()
 
 def dias_sin_medicion(df: pd.DataFrame) -> pd.DataFrame:
@@ -393,44 +397,94 @@ def dias_sin_medicion(df: pd.DataFrame) -> pd.DataFrame:
             rows.append({"equipo": eq, "ultima_medicion": str(ultima), "dias_sin_medir": dias, "estado": estado_last})
     return pd.DataFrame(rows)
 
+def color_dias(dias) -> str:
+    """Retorna color HTML según días sin medir."""
+    if dias is None: return "#666666"
+    if dias <= 10:   return "#44bb44"   # verde
+    if dias <= 14:   return "#ffcc00"   # amarillo
+    return "#ff4444"                     # rojo
+
+
+# =========================================================
+# VALIDACIÓN HORÓMETRO
+# =========================================================
+def validar_horometro(equipo: str, horometro_ingresado: float) -> dict:
+    """Compara horómetro ingresado con el del Excel. Retorna dict con alerta si hay diferencia."""
+    df_horo = cargar_horometros_db()
+    if df_horo.empty: return {"ok": True}
+    row = df_horo[df_horo["equipo"] == equipo]
+    if row.empty: return {"ok": True}
+    h_excel = float(row.iloc[0]["horometro_actual"])
+    fecha_excel = row.iloc[0]["fecha"]
+    if h_excel <= 0: return {"ok": True}
+    diferencia_pct = abs(horometro_ingresado - h_excel) / h_excel * 100
+    if diferencia_pct > HORO_TOLERANCIA_PCT:
+        return {
+            "ok": False,
+            "h_excel": h_excel,
+            "fecha_excel": fecha_excel,
+            "diferencia": abs(horometro_ingresado - h_excel),
+            "diferencia_pct": round(diferencia_pct, 1),
+        }
+    return {"ok": True}
+
 
 # =========================================================
 # REPORTE CORREO
 # =========================================================
-def generar_html_reporte(df_estados: pd.DataFrame, df_sin_medir: pd.DataFrame) -> str:
-    color_map = {"OK":"#1a5c1a","MEDIO":"#7a6000","ALTO":"#7a3000","CRÍTICO":"#7a0000","SIN DATOS":"#333"}
-    texto_map = {"OK":"✅ OK","MEDIO":"🟡 Monitoreo","ALTO":"🟠 Programar cambio","CRÍTICO":"🔴 CRÍTICO","SIN DATOS":"⚫ Sin datos"}
+def color_estado_html(estado: str) -> str:
+    m = {"OK":"#1a5c1a","MEDIO":"#7a6000","ALTO":"#7a3000","CRÍTICO":"#7a0000","SIN DATOS":"#333"}
+    return m.get(estado, "#333")
 
+def texto_estado_html(estado: str) -> str:
+    m = {"OK":"✅ OK","MEDIO":"🟡 Monitoreo","ALTO":"🟠 Programar cambio","CRÍTICO":"🔴 CRÍTICO","SIN DATOS":"⚫ Sin datos"}
+    return m.get(estado, estado)
+
+def color_dias_html(dias) -> str:
+    if dias is None: return "#666"
+    if dias <= 10:   return "#1a5c1a"
+    if dias <= 14:   return "#7a6000"
+    return "#7a0000"
+
+def generar_html_reporte(df_estados: pd.DataFrame, df_sin_medir: pd.DataFrame) -> str:
     filas = ""
     if not df_estados.empty:
         for _, r in df_estados.iterrows():
             est = str(r.get("estado",""))
-            bg  = color_map.get(est,"#333")
-            txt = texto_map.get(est, est)
+            bg_est = color_estado_html(est)
+            txt_est = texto_estado_html(est)
             mm  = f"{r['mm_usada']:.1f}" if pd.notna(r.get("mm_usada")) else "—"
             pct = f"{r['condicion_pct']:.1f}%" if pd.notna(r.get("condicion_pct")) else "—"
-            dias_c = f"{r['dias_a_critico']:.0f} días" if pd.notna(r.get("dias_a_critico")) else "—"
+            dias_c_val = r.get("dias_a_critico")
+            if pd.notna(dias_c_val):
+                dias_c_num = float(dias_c_val)
+                bg_dias = color_dias_html(dias_c_num)
+                dias_c = f'<span style="background:{bg_dias};color:white;padding:2px 8px;border-radius:4px;">{dias_c_num:.0f} días</span>'
+            else:
+                dias_c = "—"
             filas += f"""<tr>
               <td style="padding:8px;font-weight:bold;">{r['equipo']}</td>
               <td style="padding:8px;">{r.get('fecha','—')}</td>
               <td style="padding:8px;">{mm} mm</td>
               <td style="padding:8px;">{pct}</td>
-              <td style="padding:8px;background:{bg};border-radius:6px;text-align:center;">{txt}</td>
+              <td style="padding:8px;background:{bg_est};border-radius:6px;text-align:center;">{txt_est}</td>
               <td style="padding:8px;">{dias_c}</td>
             </tr>"""
 
     sin_medir = df_sin_medir[df_sin_medir["dias_sin_medir"].notna() & (df_sin_medir["dias_sin_medir"] > 7)] if not df_sin_medir.empty else pd.DataFrame()
-    filas_sm = "".join(f"<tr><td style='padding:8px;font-weight:bold;'>{r['equipo']}</td><td style='padding:8px;'>{r.get('ultima_medicion','—')}</td><td style='padding:8px;color:#ff9900;font-weight:bold;'>{int(r['dias_sin_medir'])} días</td></tr>" for _, r in sin_medir.iterrows())
+    filas_sm = ""
+    for _, r in sin_medir.iterrows():
+        d = int(r['dias_sin_medir'])
+        bg = color_dias_html(d)
+        filas_sm += f"<tr><td style='padding:8px;font-weight:bold;'>{r['equipo']}</td><td style='padding:8px;'>{r.get('ultima_medicion','—')}</td><td style='padding:8px;'><span style='background:{bg};color:white;padding:2px 8px;border-radius:4px;'>{d} días</span></td></tr>"
 
-    semana = datetime.now().isocalendar()[1]
     tabla_sm = f"""<h2 style="color:#ff9900;margin-top:30px;">⚠️ Sin medir hace más de 7 días</h2>
     <table style="width:100%;border-collapse:collapse;background:#1a1f2e;border-radius:8px;">
-    <thead><tr style="background:#7a3000;color:white;">
-    <th style="padding:10px;text-align:left;">Equipo</th>
-    <th style="padding:10px;text-align:left;">Última medición</th>
-    <th style="padding:10px;text-align:left;">Días sin medir</th>
+    <thead><tr style="background:#7a3000;color:white;"><th style="padding:10px;text-align:left;">Equipo</th>
+    <th style="padding:10px;text-align:left;">Última medición</th><th style="padding:10px;text-align:left;">Días sin medir</th>
     </tr></thead><tbody>{filas_sm}</tbody></table>""" if filas_sm else "<p style='color:#44ff88;'>✅ Todos los equipos medidos en los últimos 7 días.</p>"
 
+    semana = datetime.now().isocalendar()[1]
     return f"""<html><body style="font-family:Arial,sans-serif;background:#0f1419;color:#e0e0e0;padding:20px;">
     <div style="max-width:720px;margin:auto;">
       <div style="background:linear-gradient(90deg,#007A3D,#00A04A);padding:20px;border-radius:12px;margin-bottom:20px;">
@@ -441,32 +495,28 @@ def generar_html_reporte(df_estados: pd.DataFrame, df_sin_medir: pd.DataFrame) -
       <h2 style="color:#00A04A;">Estado de flota</h2>
       <table style="width:100%;border-collapse:collapse;background:#1a1f2e;border-radius:8px;">
         <thead><tr style="background:#007A3D;color:white;">
-          <th style="padding:10px;text-align:left;">Equipo</th>
-          <th style="padding:10px;text-align:left;">Última medición</th>
-          <th style="padding:10px;text-align:left;">mm</th>
-          <th style="padding:10px;text-align:left;">Desgaste</th>
-          <th style="padding:10px;text-align:left;">Estado</th>
-          <th style="padding:10px;text-align:left;">Días a crítico</th>
-        </tr></thead>
-        <tbody>{filas}</tbody>
+          <th style="padding:10px;text-align:left;">Equipo</th><th style="padding:10px;text-align:left;">Última medición</th>
+          <th style="padding:10px;text-align:left;">mm</th><th style="padding:10px;text-align:left;">Desgaste</th>
+          <th style="padding:10px;text-align:left;">Estado</th><th style="padding:10px;text-align:left;">Días a crítico</th>
+        </tr></thead><tbody>{filas}</tbody>
       </table>
       {tabla_sm}
-      <p style="margin-top:30px;color:#555;font-size:12px;">GET Wear Monitor · Teck QB2 · Generado automáticamente</p>
+      <p style="margin-top:30px;color:#555;font-size:12px;">GET Wear Monitor · Teck QB2</p>
     </div></body></html>"""
 
 
-def enviar_correo(destinatarios: list[str], html: str, excel_data: bytes, nombre_excel: str) -> tuple[bool, str]:
+def enviar_correo(destinatarios, html, excel_data, nombre_excel):
     try:
         smtp_user = st.secrets.get("SMTP_USER","")
         smtp_pass = st.secrets.get("SMTP_PASS","")
         smtp_host = st.secrets.get("SMTP_HOST","smtp.gmail.com")
         smtp_port = int(st.secrets.get("SMTP_PORT", 587))
         if not smtp_user or not smtp_pass:
-            return False, "Configura SMTP_USER y SMTP_PASS en Secrets de Streamlit."
+            return False, "Configura SMTP_USER y SMTP_PASS en Secrets."
         semana = datetime.now().isocalendar()[1]
         msg = MIMEMultipart("mixed")
-        msg["From"]    = smtp_user
-        msg["To"]      = ", ".join(destinatarios)
+        msg["From"] = smtp_user
+        msg["To"] = ", ".join(destinatarios)
         msg["Subject"] = f"GET Wear Monitor · Reporte Semana {semana} · {date.today()}"
         msg.attach(MIMEText(html, "html"))
         part = MIMEBase("application","octet-stream")
@@ -483,46 +533,284 @@ def enviar_correo(destinatarios: list[str], html: str, excel_data: bytes, nombre
         return False, str(e)
 
 
+
+# =========================================================
+# REPORTE EJECUTIVO DOCX
+# =========================================================
+def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: str, semana: int, anio: int) -> bytes:
+    from docx import Document as DocxDoc
+    from docx.shared import Pt, RGBColor, Inches, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_ALIGN_VERTICAL
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    import copy
+
+    TECK_BLUE  = RGBColor(0x1F, 0x6F, 0xAE)
+    TECK_GREEN = RGBColor(0x00, 0x7A, 0x3D)
+    TECK_DARK  = RGBColor(0x0D, 0x1F, 0x2D)
+    GRAY       = RGBColor(0x4A, 0x55, 0x68)
+
+    OK_BG    = "D4EDDA"; OK_FG    = RGBColor(0x15, 0x57, 0x24)
+    MED_BG   = "FFF3CD"; MED_FG   = RGBColor(0x85, 0x64, 0x04)
+    ALT_BG   = "FFE0B2"; ALT_FG   = RGBColor(0xE6, 0x51, 0x00)
+    CRIT_BG  = "F8D7DA"; CRIT_FG  = RGBColor(0x72, 0x1C, 0x24)
+    DIAS_OK  = "D4EDDA"; DIAS_MED = "FFF3CD"; DIAS_CRIT = "F8D7DA"
+    LIGHT_BG = "EBF5FB"
+
+    def status_colors(estado):
+        m = {"OK":(OK_BG,OK_FG),"MEDIO":(MED_BG,MED_FG),"ALTO":(ALT_BG,ALT_FG),"CRÍTICO":(CRIT_BG,CRIT_FG)}
+        return m.get(estado,(OK_BG, OK_FG))
+
+    def dias_colors(dias):
+        if dias is None: return (OK_BG, OK_FG)
+        d = float(dias)
+        if d <= 10:  return (DIAS_OK,  RGBColor(0x1B,0x5E,0x20))
+        if d <= 14:  return (DIAS_MED, RGBColor(0xF5,0x7F,0x17))
+        return (DIAS_CRIT, RGBColor(0xB7,0x1C,0x1C))
+
+    def pct_colors(pct):
+        if pct is None: return (OK_BG, OK_FG)
+        p = float(pct)
+        if p >= 75: return (CRIT_BG, CRIT_FG)
+        if p >= 45: return (MED_BG,  MED_FG)
+        return (OK_BG, OK_FG)
+
+    def set_cell_bg(cell, hex_color):
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), hex_color)
+        tcPr.append(shd)
+
+    def add_cell(table_cell, text, bold=False, color=None, bg=None, size=9, align=WD_ALIGN_PARAGRAPH.LEFT, italics=False):
+        if bg: set_cell_bg(table_cell, bg)
+        table_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        p_cell = table_cell.paragraphs[0]
+        p_cell.alignment = align
+        p_cell.paragraph_format.space_before = Pt(2)
+        p_cell.paragraph_format.space_after = Pt(2)
+        run = p_cell.add_run(text)
+        run.font.name = "Arial"
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.italic = italics
+        if color: run.font.color.rgb = color
+        return run
+
+    doc = DocxDoc()
+    # Márgenes
+    for section in doc.sections:
+        section.top_margin    = Cm(1.8)
+        section.bottom_margin = Cm(1.8)
+        section.left_margin   = Cm(2.0)
+        section.right_margin  = Cm(2.0)
+
+    # ── PORTADA ──
+    title_p = doc.add_paragraph()
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title_p.add_run("REPORTE EJECUTIVO")
+    run.font.name = "Arial"; run.font.size = Pt(28); run.font.bold = True
+    run.font.color.rgb = TECK_DARK
+
+    sub_p = doc.add_paragraph()
+    sub_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run2 = sub_p.add_run("GET Wear Monitor  ·  Teck QB2")
+    run2.font.name = "Arial"; run2.font.size = Pt(16)
+    run2.font.color.rgb = TECK_BLUE
+
+    per_p = doc.add_paragraph()
+    per_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run3 = per_p.add_run(f"Período: {periodo}  ·  Semana {semana}/{anio}  ·  {fecha_str}")
+    run3.font.name = "Arial"; run3.font.size = Pt(11); run3.font.italic = True
+    run3.font.color.rgb = GRAY
+
+    doc.add_paragraph()
+
+    # ── KPIs ──
+    kpi_ok   = len([f for f in flota_data if f["estado"]=="OK"])
+    kpi_med  = len([f for f in flota_data if f["estado"]=="MEDIO"])
+    kpi_alto = len([f for f in flota_data if f["estado"]=="ALTO"])
+    kpi_crit = len([f for f in flota_data if f["estado"]=="CRÍTICO"])
+
+    h = doc.add_heading("1. Resumen Ejecutivo", level=1)
+    h.runs[0].font.color.rgb = TECK_BLUE
+
+    kpi_table = doc.add_table(rows=2, cols=4)
+    kpi_table.style = "Table Grid"
+    kpi_data = [
+        (str(kpi_ok),   "🟢 OK",      "Operación normal",   OK_BG,   OK_FG),
+        (str(kpi_med),  "🟡 Monitoreo","Atención requerida", MED_BG,  MED_FG),
+        (str(kpi_alto), "🟠 Programar","Coordinar cambio",   ALT_BG,  ALT_FG),
+        (str(kpi_crit), "🔴 Crítico",  "Acción inmediata",   CRIT_BG, CRIT_FG),
+    ]
+    for i,(num,lbl,desc,bg,fg) in enumerate(kpi_data):
+        c = kpi_table.cell(0,i); set_cell_bg(c, bg)
+        p_c = c.paragraphs[0]; p_c.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p_c.add_run(num); r.font.name="Arial"; r.font.size=Pt(28); r.font.bold=True; r.font.color.rgb=fg
+        c2 = kpi_table.cell(1,i); set_cell_bg(c2, bg)
+        p_c2 = c2.paragraphs[0]; p_c2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r2 = p_c2.add_run(f"{lbl}\n{desc}"); r2.font.name="Arial"; r2.font.size=Pt(9); r2.font.bold=True; r2.font.color.rgb=fg
+
+    doc.add_paragraph()
+
+    # ── TABLA ESTADO FLOTA ──
+    h2 = doc.add_heading("2. Estado Completo de Flota", level=1)
+    h2.runs[0].font.color.rgb = TECK_BLUE
+
+    flota_sorted = sorted(flota_data, key=lambda x: x["pct"], reverse=True)
+    t = doc.add_table(rows=1+len(flota_sorted), cols=7)
+    t.style = "Table Grid"
+
+    headers = ["Equipo","Tipo","mm actual","Desgaste %","Estado","Días a crítico","Prioridad"]
+    widths_cm = [1.5, 3.5, 2.0, 2.0, 2.5, 2.5, 2.5]
+    for i,(hdr,w) in enumerate(zip(headers,widths_cm)):
+        cell_h = t.cell(0,i)
+        set_cell_bg(cell_h, "1F6FAE")
+        add_cell(cell_h, hdr, bold=True, color=RGBColor(255,255,255), size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+    for ri, f in enumerate(flota_sorted):
+        row_bg = LIGHT_BG if ri%2==0 else "FFFFFF"
+        bg_e, fg_e = status_colors(f["estado"])
+        bg_p, fg_p = pct_colors(f["pct"])
+        bg_d, fg_d = dias_colors(f["d_crit"])
+
+        prio = "Normal"; prio_bg = OK_BG; prio_fg = OK_FG
+        if f["estado"]=="CRÍTICO": prio="URGENTE"; prio_bg=CRIT_BG; prio_fg=CRIT_FG
+        elif f["estado"]=="ALTO":  prio="ESTA SEMANA"; prio_bg=ALT_BG; prio_fg=ALT_FG
+        elif f["d_crit"] and f["d_crit"]<=14: prio="PRÓX. SEMANA"; prio_bg=MED_BG; prio_fg=MED_FG
+
+        vals = [
+            (f["equipo"],                    row_bg, GRAY,   True, WD_ALIGN_PARAGRAPH.CENTER),
+            (f["tipo"],                      row_bg, GRAY,   False,WD_ALIGN_PARAGRAPH.LEFT),
+            (f"{f['mm']:.0f} mm",            row_bg, GRAY,   False,WD_ALIGN_PARAGRAPH.CENTER),
+            (f"{f['pct']:.1f}%",             bg_p,   fg_p,   True, WD_ALIGN_PARAGRAPH.CENTER),
+            (f["estado"],                    bg_e,   fg_e,   True, WD_ALIGN_PARAGRAPH.CENTER),
+            (f"{f['d_crit']:.0f} días" if f["d_crit"] is not None else "—", bg_d, fg_d, True, WD_ALIGN_PARAGRAPH.CENTER),
+            (prio,                           prio_bg,prio_fg,True, WD_ALIGN_PARAGRAPH.CENTER),
+        ]
+        for ci,(txt,bg,fg,bld,aln) in enumerate(vals):
+            add_cell(t.cell(ri+1,ci), txt, bold=bld, color=fg, bg=bg, size=9, align=aln)
+
+    doc.add_paragraph()
+
+    # ── PROYECCIÓN ──
+    h3 = doc.add_heading("3. Proyección de Cambios (próximos 60 días)", level=1)
+    h3.runs[0].font.color.rgb = TECK_BLUE
+
+    flota_proj = sorted([f for f in flota_data if f["d_crit"] is not None], key=lambda x: x["d_crit"])
+    if flota_proj:
+        tp = doc.add_table(rows=1+len(flota_proj), cols=5)
+        tp.style = "Table Grid"
+        for i,hdr in enumerate(["Equipo","Tipo","Días a crítico","Estado","Prioridad"]):
+            ch = tp.cell(0,i); set_cell_bg(ch,"007A3D")
+            add_cell(ch, hdr, bold=True, color=RGBColor(255,255,255), size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
+        for ri,f in enumerate(flota_proj):
+            bg_e, fg_e = status_colors(f["estado"])
+            bg_d, fg_d = dias_colors(f["d_crit"])
+            prio="Normal"; prio_bg=OK_BG; prio_fg=OK_FG
+            if f["estado"]=="CRÍTICO": prio="🔴 URGENTE"; prio_bg=CRIT_BG; prio_fg=CRIT_FG
+            elif f["estado"]=="ALTO":  prio="🟠 ESTA SEMANA"; prio_bg=ALT_BG; prio_fg=ALT_FG
+            elif f["d_crit"]<=14:      prio="🟡 PRÓX. SEMANA"; prio_bg=MED_BG; prio_fg=MED_FG
+            row_bg = LIGHT_BG if ri%2==0 else "FFFFFF"
+            vals2 = [
+                (f["equipo"],row_bg,GRAY,True,WD_ALIGN_PARAGRAPH.CENTER),
+                (f["tipo"],row_bg,GRAY,False,WD_ALIGN_PARAGRAPH.LEFT),
+                (f"{f['d_crit']:.0f} días",bg_d,fg_d,True,WD_ALIGN_PARAGRAPH.CENTER),
+                (f["estado"],bg_e,fg_e,True,WD_ALIGN_PARAGRAPH.CENTER),
+                (prio,prio_bg,prio_fg,True,WD_ALIGN_PARAGRAPH.CENTER),
+            ]
+            for ci,(txt,bg,fg,bld,aln) in enumerate(vals2):
+                add_cell(tp.cell(ri+1,ci), txt, bold=bld, color=fg, bg=bg, size=9, align=aln)
+
+    doc.add_paragraph()
+
+    # ── CONCLUSIONES ──
+    h4 = doc.add_heading("4. Conclusiones y Recomendaciones", level=1)
+    h4.runs[0].font.color.rgb = TECK_BLUE
+
+    criticos_list = [f for f in flota_data if f["estado"] in ("CRÍTICO","ALTO")]
+    medio_list    = [f for f in flota_data if f["estado"]=="MEDIO"]
+
+    if criticos_list:
+        p_c = doc.add_paragraph()
+        r_c = p_c.add_run("🔴  ACCIÓN INMEDIATA: ")
+        r_c.font.name="Arial"; r_c.font.bold=True; r_c.font.color.rgb=CRIT_FG; r_c.font.size=Pt(10)
+        r_c2 = p_c.add_run(", ".join([f"Equipo {f['equipo']} ({f['estado']})" for f in criticos_list]))
+        r_c2.font.name="Arial"; r_c2.font.size=Pt(10); r_c2.font.color.rgb=CRIT_FG
+
+    if medio_list:
+        p_m = doc.add_paragraph()
+        r_m = p_m.add_run("🟡  MONITOREO: ")
+        r_m.font.name="Arial"; r_m.font.bold=True; r_m.font.color.rgb=MED_FG; r_m.font.size=Pt(10)
+        r_m2 = p_m.add_run(", ".join([f"Equipo {f['equipo']} ({f['pct']:.0f}% desgaste)" for f in medio_list]))
+        r_m2.font.name="Arial"; r_m2.font.size=Pt(10); r_m2.font.color.rgb=MED_FG
+
+    p_ok = doc.add_paragraph()
+    r_ok = p_ok.add_run(f"🟢  FLOTA OK: {kpi_ok} equipos en condición normal. Continuar monitoreo semanal.")
+    r_ok.font.name="Arial"; r_ok.font.size=Pt(10); r_ok.font.color.rgb=OK_FG
+
+    doc.add_paragraph()
+    p_firma = doc.add_paragraph()
+    p_firma.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r_firma = p_firma.add_run(f"Pablo Cortés Ramos  ·  Ingeniero de Mantenimiento / Confiabilidad  ·  Teck QB2  ·  {fecha_str}")
+    r_firma.font.name="Arial"; r_firma.font.size=Pt(9); r_firma.font.color.rgb=GRAY; r_firma.font.italic=True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
 # =========================================================
 # APP UI
 # =========================================================
 inject_style()
 render_header()
 
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD","")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "254828")
 
 with st.sidebar:
     st.subheader("Administración")
     admin_ok = False
-    if ADMIN_PASSWORD:
-        pwd = st.text_input("Clave administrador", type="password")
-        admin_ok = pwd == ADMIN_PASSWORD
+    pwd = st.text_input("Clave administrador", type="password")
+    if pwd:
+        admin_ok = (pwd == ADMIN_PASSWORD)
         if admin_ok:
             st.success("✅ Modo administrador activo")
-            st.divider()
-            st.markdown("**🗑️ Eliminar datos de prueba**")
-            if st.button("Limpiar datos de prueba", type="primary"):
-                try:
-                    sb().table("mediciones").delete().in_("usuario",[
-                        "Juan Pérez","Carlos Díaz","Mario Soto","Pedro Rojas",
-                        "Luis Mora","Ana Torres","Roberto Lima","prueba","test","demo"
-                    ]).execute()
-                    cargar_historial.clear()
-                    st.success("✅ Datos de prueba eliminados.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
-    else:
-        st.info("Sin clave configurada.")
+        else:
+            st.error("Clave incorrecta")
 
-tabs = st.tabs([
+    if admin_ok:
+        st.divider()
+        st.markdown("**🗑️ Eliminar datos de prueba**")
+        st.caption("Elimina todos los registros anteriores al 16 de abril de 2026.")
+        if st.button("Limpiar datos de prueba", type="primary"):
+            try:
+                sb().table("mediciones").delete().lt("fecha", "2026-04-16").execute()
+                sb().table("cambios_cuchilla").delete().lt("fecha", "2026-04-16").execute()
+                cargar_historial.clear()
+                cargar_cambios.clear()
+                st.success("✅ Datos de prueba eliminados. Solo quedan registros desde el 16/04/2026.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# Pestañas base siempre visibles
+tabs_base = [
     "📏 Ingreso Medición",
     "🔄 Cambio de Cuchilla",
     "📋 Historial",
     "🚛 Estado Flota",
     "📂 Horómetros Excel",
     "📊 Reporte Semanal",
-])
+    "📄 Reporte Ejecutivo",
+]
+if admin_ok:
+    tabs_base.append("👥 Accesos")
+
+tabs = st.tabs(tabs_base)
+TAB_ACCESOS = 7 if admin_ok else None
 
 
 # ─────────────────────────────────────────────
@@ -538,16 +826,29 @@ with tabs[0]:
         st.divider()
         regla   = regla_por_equipo(equipo)
         mm_max  = REGLAS[regla]["mm_nuevo"]
-        horometro_m = st.number_input("Horómetro", min_value=0.0, step=1.0, key="h_m")
 
-        # Sugerir horómetro desde Excel si está disponible
+        # Mostrar horómetro sugerido desde Excel
         df_horo = cargar_horometros_db()
+        h_sugerido = None
         if not df_horo.empty:
             row_h = df_horo[df_horo["equipo"] == equipo]
             if not row_h.empty:
-                h_excel = row_h.iloc[0]["horometro_actual"]
+                h_sugerido = float(row_h.iloc[0]["horometro_actual"])
                 fecha_excel = row_h.iloc[0]["fecha"]
-                st.caption(f"📊 Excel horómetros: **{h_excel:,.0f} hrs** al {fecha_excel}")
+                st.caption(f"📊 Excel horómetros: **{h_sugerido:,.0f} hrs** al {fecha_excel}")
+
+        horometro_m = st.number_input("Horómetro", min_value=0.0, step=1.0, key="h_m",
+                                       value=float(h_sugerido) if h_sugerido else 0.0)
+
+        # ✅ VALIDACIÓN HORÓMETRO EN TIEMPO REAL
+        if horometro_m > 0 and h_sugerido:
+            val = validar_horometro(equipo, horometro_m)
+            if not val["ok"]:
+                st.warning(
+                    f"⚠️ **Horómetro inusual** — diferencia de {val['diferencia']:,.0f} hrs "
+                    f"({val['diferencia_pct']}%) respecto al Excel ({val['h_excel']:,.0f} hrs al {val['fecha_excel']}). "
+                    f"Verifica antes de guardar."
+                )
 
         mm_izq_m = st.number_input("Medición IZQ (mm)", min_value=0.0, value=mm_max, step=0.1, key="mi_m")
         mm_der_m = st.number_input("Medición DER (mm)", min_value=0.0, value=mm_max, step=0.1, key="md_m")
@@ -572,12 +873,10 @@ with tabs[0]:
                     guardar_medicion(fecha_m, equipo, horometro_m, mm_izq_m, mm_der_m, usuario_m, r)
                     st.success("✅ Medición guardada.")
                     ca, cb, cc = st.columns(3)
-                    ca.metric("Estado",     f"{COLOR_ESTADO.get(r['estado'],'⚪')} {r['estado']}")
+                    ca.metric("Estado", f"{COLOR_ESTADO.get(r['estado'],'⚪')} {r['estado']}")
                     cb.metric("Desgaste %", f"{r['pct']:.1f}%")
-                    cc.metric("mm usada",   f"{r['mm_usada']:.1f}")
-                    fuente = r.get("fuente_tasa","")
-                    if r.get("tasa"):    st.info(f"Tasa: **{r['tasa']} mm/h** · {fuente}")
-                    elif fuente:         st.info(f"Proyección calculada desde: **{fuente}**")
+                    cc.metric("mm usada", f"{r['mm_usada']:.1f}")
+                    if r.get("tasa"):    st.info(f"Tasa: **{r['tasa']} mm/h** · {r.get('fuente_tasa','')}")
                     if r.get("h_critico") is not None:
                         st.warning(f"⏱ Proyección a crítico: ~{r['h_critico']} h / ~{r['d_critico']} días")
                 except Exception as e:
@@ -586,9 +885,11 @@ with tabs[0]:
     with c2:
         st.subheader(f"Curva de desgaste — Equipo {equipo}")
         df_curva = cargar_historial(500)
-        df_eq = df_curva[(df_curva["equipo"]==equipo) & (df_curva.get("es_cambio",pd.Series([False]*len(df_curva)))==False)].copy() if not df_curva.empty else pd.DataFrame()
-        if "es_cambio" in df_eq.columns:
-            df_eq = df_eq[df_eq["es_cambio"]==False]
+        df_eq = pd.DataFrame()
+        if not df_curva.empty and "equipo" in df_curva.columns:
+            df_eq = df_curva[df_curva["equipo"] == equipo].copy()
+            if "es_cambio" in df_eq.columns:
+                df_eq = df_eq[df_eq["es_cambio"] == False]
         if not df_eq.empty and "horometro" in df_eq.columns and "mm_usada" in df_eq.columns:
             df_eq = df_eq.dropna(subset=["horometro","mm_usada"]).sort_values("horometro")
             cfg_eq = REGLAS[regla_por_equipo(equipo)]
@@ -606,7 +907,7 @@ with tabs[0]:
 
 
 # ─────────────────────────────────────────────
-# TAB 2: CAMBIO DE CUCHILLA (FUSIONADO)
+# TAB 2: CAMBIO DE CUCHILLA
 # ─────────────────────────────────────────────
 with tabs[1]:
     sub1, sub2 = st.tabs(["➕ Registrar cambio", "📋 Historial de cambios"])
@@ -661,7 +962,7 @@ with tabs[1]:
 
 
 # ─────────────────────────────────────────────
-# TAB 3: HISTORIAL
+# TAB 3: HISTORIAL + EDICIÓN ADMIN
 # ─────────────────────────────────────────────
 with tabs[2]:
     st.subheader("📋 Historial completo")
@@ -676,6 +977,49 @@ with tabs[2]:
         cols_h = [c for c in ["fecha","equipo","horometro","mm_izq","mm_der","mm_usada","condicion_pct","estado","usuario"] if c in df_sh.columns]
         st.dataframe(df_sh[cols_h], use_container_width=True)
         st.download_button("⬇️ Descargar Excel", data=excel_bytes(df_sh[cols_h]), file_name="historial.xlsx")
+
+        # ✅ EDICIÓN SOLO PARA ADMIN
+        if admin_ok:
+            st.divider()
+            st.markdown("### ✏️ Editar medición (Administrador)")
+            st.caption("Selecciona la medición a corregir — útil para corregir horómetros o mm erróneos.")
+
+            df_edit = df_h[["id","fecha","equipo","horometro","mm_izq","mm_der","mm_usada","estado","usuario"]].copy()
+            df_edit["descripcion"] = df_edit.apply(
+                lambda r: f"ID {int(r['id'])} | {r['fecha']} | Eq {r['equipo']} | Horo {r['horometro']:,.0f} | {r['usuario']}", axis=1
+            )
+            sel = st.selectbox("Seleccionar medición a editar", [""] + df_edit["descripcion"].tolist(), key="sel_edit")
+
+            if sel:
+                id_edit = int(sel.split("|")[0].replace("ID","").strip())
+                row_edit = df_h[df_h["id"] == id_edit].iloc[0]
+                eq_edit = str(row_edit["equipo"])
+
+                st.markdown(f"**Editando:** Equipo {eq_edit} · {row_edit['fecha']} · Usuario original: {row_edit['usuario']}")
+
+                ce1, ce2, ce3 = st.columns(3)
+                with ce1:
+                    horo_edit = st.number_input("Horómetro corregido", value=float(row_edit["horometro"]), step=1.0, key="horo_edit")
+                with ce2:
+                    mm_izq_edit = st.number_input("IZQ corregida (mm)", value=float(row_edit["mm_izq"]), step=0.1, key="mi_edit")
+                with ce3:
+                    mm_der_edit = st.number_input("DER corregida (mm)", value=float(row_edit["mm_der"]), step=0.1, key="md_edit")
+
+                usuario_edit = st.text_input("Nombre del técnico (corrección)", value=str(row_edit["usuario"]), key="u_edit")
+
+                # Validar horómetro corregido
+                if horo_edit > 0:
+                    val_edit = validar_horometro(eq_edit, horo_edit)
+                    if not val_edit["ok"]:
+                        st.warning(f"⚠️ Horómetro corregido aún difiere del Excel ({val_edit['h_excel']:,.0f} hrs). Verifica que sea correcto.")
+
+                if st.button("💾 Guardar corrección", type="primary", key="btn_edit"):
+                    try:
+                        actualizar_medicion(id_edit, horo_edit, mm_izq_edit, mm_der_edit, usuario_edit, eq_edit)
+                        st.success(f"✅ Medición ID {id_edit} actualizada correctamente.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
     else:
         st.info("Sin mediciones aún.")
 
@@ -705,12 +1049,21 @@ with tabs[3]:
         st.divider()
         st.subheader("Días sin medición")
         df_dias = dias_sin_medicion(df_flota)
-        def color_dias(val):
-            if pd.isna(val): return "color:gray"
-            if val > 14: return "color:#ff4444;font-weight:bold"
-            if val > 7:  return "color:#ff9900"
-            return "color:#44ff88"
-        st.dataframe(df_dias.style.map(color_dias, subset=["dias_sin_medir"]), use_container_width=True)
+
+        # Mostrar tabla con colores
+        def color_fila_dias(val):
+            try:
+                v = float(val)
+                if v <= 10:  return "color:#44bb44;font-weight:bold"
+                if v <= 14:  return "color:#ffcc00;font-weight:bold"
+                return "color:#ff4444;font-weight:bold"
+            except:
+                return "color:gray"
+
+        st.dataframe(
+            df_dias.style.map(color_fila_dias, subset=["dias_sin_medir"]),
+            use_container_width=True
+        )
 
         st.divider()
         st.subheader("Proyección de cambios")
@@ -719,22 +1072,14 @@ with tabs[3]:
         st.dataframe(proy, use_container_width=True)
     else:
         st.info("Sin datos de flota aún.")
-        try:
-            resp = sb().table("mediciones").select("id,equipo").limit(3).execute()
-            st.write("🔌 Debug conexión:", resp.data)
-        except Exception as e:
-            st.error(f"❌ Error conexión: {e}")
 
 
 # ─────────────────────────────────────────────
-# TAB 5: HORÓMETROS EXCEL ← NUEVO
+# TAB 5: HORÓMETROS EXCEL
 # ─────────────────────────────────────────────
 with tabs[4]:
     st.subheader("📂 Carga de horómetros desde Excel")
-    st.caption(
-        "Sube el archivo **Control_Horómetro_TMF_Rev10.xlsm** para actualizar el horómetro actual "
-        "y los promedios h/día de cada equipo. Esto mejora la proyección cuando no hay mediciones recientes."
-    )
+    st.caption("Sube el archivo Control_Horómetro_TMF_Rev10.xlsm. Los valores negativos o absurdos se corrigen automáticamente.")
 
     archivo = st.file_uploader("Seleccionar archivo Excel (.xlsm / .xlsx)", type=["xlsm","xlsx"], key="upload_horo")
 
@@ -742,10 +1087,17 @@ with tabs[4]:
         try:
             df_preview = leer_excel_horometros(archivo)
             if df_preview.empty:
-                st.warning("No se encontraron equipos GET en el archivo. Verifica que sea el archivo correcto.")
+                st.warning("No se encontraron equipos GET en el archivo.")
             else:
+                # Mostrar advertencias de corrección
+                if "tiene_error" in df_preview.columns:
+                    errores_excel = df_preview[df_preview["tiene_error"] == True]
+                    if not errores_excel.empty:
+                        st.warning(f"⚠️ Se detectaron y corrigieron valores inválidos en {len(errores_excel)} equipos: **{', '.join(errores_excel['equipo'].tolist())}**. Los promedios negativos fueron reemplazados por el valor histórico.")
+
                 st.success(f"✅ Se encontraron **{len(df_preview)} equipos** en el Excel.")
                 cols_show = ["equipo","fecha","horometro_actual","promedio_7d","promedio_30d","promedio_historico"]
+                cols_show = [c for c in cols_show if c in df_preview.columns]
                 st.dataframe(df_preview[cols_show], use_container_width=True)
 
                 if st.button("💾 Guardar horómetros en base de datos", type="primary", key="btn_guardar_horo"):
@@ -762,7 +1114,7 @@ with tabs[4]:
         cols_h = [c for c in ["equipo","fecha","horometro_actual","promedio_7d","promedio_30d","promedio_historico"] if c in df_horo_db.columns]
         st.dataframe(df_horo_db[cols_h].sort_values("equipo"), use_container_width=True)
     else:
-        st.info("Sin horómetros cargados aún. Sube el Excel para comenzar.")
+        st.info("Sin horómetros cargados aún.")
 
 
 # ─────────────────────────────────────────────
@@ -785,18 +1137,48 @@ with tabs[5]:
             icon   = COLOR_ESTADO.get(estado,"⚪")
             mm     = f"{row['mm_usada']:.1f} mm" if pd.notna(row.get("mm_usada")) else "—"
             pct    = f"{row['condicion_pct']:.1f}%" if pd.notna(row.get("condicion_pct")) else "—"
-            dias_c = f"{row['dias_a_critico']:.0f} días" if pd.notna(row.get("dias_a_critico")) else "—"
+
+            # ✅ COLORES DÍAS A CRÍTICO
+            dias_c_val = row.get("dias_a_critico")
+            if pd.notna(dias_c_val):
+                d = float(dias_c_val)
+                if d <= 10:   col_dias = "#44bb44"
+                elif d <= 14: col_dias = "#ffcc00"
+                else:         col_dias = "#ff4444"
+                dias_c_html = f'<span style="background:{col_dias};color:{"black" if d<=14 else "white"};padding:2px 10px;border-radius:6px;font-weight:bold;">{d:.0f} días</span>'
+            else:
+                dias_c_html = "—"
+
+            # ✅ COLOR DESGASTE %
+            pct_val = row.get("condicion_pct")
+            if pd.notna(pct_val):
+                p = float(pct_val)
+                if p >= 75:   col_pct = "#ff4444"
+                elif p >= 45: col_pct = "#ffcc00"
+                else:         col_pct = "#44bb44"
+                pct_html = f'<span style="background:{col_pct};color:{"black" if p<75 else "white"};padding:2px 10px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
+            else:
+                pct_html = "—"
+
             st.markdown(
                 f'<div class="equipo-card" style="background:{bg};">'
                 f'<b>Equipo {row["equipo"]}</b> &nbsp;|&nbsp; {icon} {estado} &nbsp;|&nbsp;'
-                f' {mm} &nbsp;|&nbsp; Desgaste: {pct} &nbsp;|&nbsp; Días a crítico: {dias_c}'
+                f' {mm} &nbsp;|&nbsp; Desgaste: {pct_html} &nbsp;|&nbsp; Días a crítico: {dias_c_html}'
                 f'</div>', unsafe_allow_html=True)
 
         st.divider()
         st.markdown("#### Equipos sin medir (> 7 días)")
         sin_medir_r = df_dias_r[df_dias_r["dias_sin_medir"].notna() & (df_dias_r["dias_sin_medir"] > 7)]
         if not sin_medir_r.empty:
-            st.dataframe(sin_medir_r, use_container_width=True)
+            # Mostrar con colores
+            for _, r in sin_medir_r.iterrows():
+                d = int(r["dias_sin_medir"])
+                c = color_dias(d)
+                st.markdown(
+                    f'<div class="equipo-card" style="background:#1a1f2e;">'
+                    f'<b>Equipo {r["equipo"]}</b> &nbsp;|&nbsp; Última medición: {r["ultima_medicion"]} &nbsp;|&nbsp;'
+                    f' <span style="color:{c};font-weight:bold;">{d} días sin medir</span>'
+                    f'</div>', unsafe_allow_html=True)
         else:
             st.success("✅ Todos los equipos medidos en los últimos 7 días.")
 
@@ -827,3 +1209,195 @@ with tabs[5]:
             file_name=f"reporte_semana_{semana}.xlsx")
     else:
         st.info("Sin datos para generar reporte.")
+
+
+# ─────────────────────────────────────────────
+# TAB 7: REPORTE EJECUTIVO
+# ─────────────────────────────────────────────
+with tabs[6]:
+    st.subheader("📄 Reporte Ejecutivo")
+    st.caption("Genera un reporte Word profesional con formato Teck para el período seleccionado.")
+
+    # Semana operacional: jueves a miércoles
+    def semana_operacional(hoy: date):
+        """Retorna (jueves inicio, miércoles fin) de la semana operacional actual."""
+        # weekday(): 0=lunes ... 3=jueves ... 6=domingo
+        dias_desde_jueves = (hoy.weekday() - 3) % 7
+        jueves = hoy - timedelta(days=dias_desde_jueves)
+        miercoles = jueves + timedelta(days=6)
+        return jueves, miercoles
+
+    jue_default, mie_default = semana_operacional(date.today())
+    st.caption(f"📅 Semana operacional actual: **{jue_default.strftime('%d/%m/%Y')} (Jue) → {mie_default.strftime('%d/%m/%Y')} (Mié)**")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        fecha_inicio_rep = st.date_input("Fecha inicio (Jueves)", value=jue_default, key="fi_rep")
+    with col_f2:
+        fecha_fin_rep = st.date_input("Fecha fin (Miércoles)", value=mie_default, key="ff_rep")
+
+    if fecha_fin_rep < fecha_inicio_rep:
+        st.error("La fecha fin debe ser mayor a la fecha inicio.")
+    else:
+        periodo_str = f"{fecha_inicio_rep.strftime('%d %b %Y')} – {fecha_fin_rep.strftime('%d %b %Y')}"
+        fecha_rep_str = fecha_fin_rep.strftime("%d de %B de %Y").replace(
+            "January","Enero").replace("February","Febrero").replace("March","Marzo").replace(
+            "April","Abril").replace("May","Mayo").replace("June","Junio").replace(
+            "July","Julio").replace("August","Agosto").replace("September","Septiembre").replace(
+            "October","Octubre").replace("November","Noviembre").replace("December","Diciembre")
+        semana_rep = fecha_fin_rep.isocalendar()[1]
+
+        st.info(f"**Período:** {periodo_str}  ·  **Semana {semana_rep} / {fecha_fin_rep.year}**")
+
+        if st.button("📄 Generar Reporte Ejecutivo Word", type="primary", key="btn_rep"):
+            try:
+                # Cargar datos del período
+                df_all = cargar_historial(5000)
+                if df_all.empty:
+                    st.error("Sin datos para generar el reporte.")
+                else:
+                    # Filtrar por período
+                    df_all["fecha_dt"] = pd.to_datetime(df_all["fecha"], errors="coerce")
+                    df_periodo = df_all[
+                        (df_all["fecha_dt"].dt.date >= fecha_inicio_rep) &
+                        (df_all["fecha_dt"].dt.date <= fecha_fin_rep)
+                    ]
+                    # Últimos estados de cada equipo
+                    df_ultimos = ultimos_por_equipo(df_all)
+
+                    # Construir lista flota para el reporte
+                    TIPO_EQUIPO = {
+                        "101":"Dozer DZ","102":"Dozer DZ","103":"Dozer DZ","104":"Dozer DZ",
+                        "105":"Dozer DZ","106":"Dozer DZ","108":"Dozer DZ",
+                        "201":"WheelDozer WD","202":"WheelDozer WD","203":"WheelDozer WD",
+                        "204":"WheelDozer WD","205":"WheelDozer WD",
+                        "301":"Motoniveladora GR","302":"Motoniveladora GR","303":"Motoniveladora GR",
+                    }
+
+                    flota_data = []
+                    for eq in EQUIPOS:
+                        row = df_ultimos[df_ultimos["equipo"] == eq]
+                        if row.empty: continue
+                        r = row.iloc[0]
+                        flota_data.append({
+                            "equipo": eq,
+                            "tipo": TIPO_EQUIPO.get(eq, "Equipo"),
+                            "mm": float(r.get("mm_usada", 0)) if pd.notna(r.get("mm_usada")) else 0,
+                            "pct": float(r.get("condicion_pct", 0)) if pd.notna(r.get("condicion_pct")) else 0,
+                            "estado": str(r.get("estado", "OK")),
+                            "tasa": float(r.get("tasa_mm_h", 0)) if pd.notna(r.get("tasa_mm_h")) else None,
+                            "h_crit": float(r.get("horas_a_critico", 0)) if pd.notna(r.get("horas_a_critico")) else None,
+                            "d_crit": float(r.get("dias_a_critico", 0)) if pd.notna(r.get("dias_a_critico")) else None,
+                            "ultima": str(r.get("fecha", "")),
+                            "dias_sin": (date.today() - pd.to_datetime(r.get("fecha")).date()).days if pd.notna(r.get("fecha")) else None,
+                        })
+
+                    # Generar reporte via Python docx
+                    buf = generar_reporte_ejecutivo_docx(
+                        flota_data, periodo_str, fecha_rep_str, semana_rep, fecha_fin_rep.year
+                    )
+
+                    st.success("✅ Reporte generado correctamente.")
+                    st.download_button(
+                        "⬇️ Descargar Reporte Ejecutivo Word",
+                        data=buf,
+                        file_name=f"Reporte_Ejecutivo_GET_S{semana_rep}_{fecha_fin_rep}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="dl_rep"
+                    )
+            except Exception as e:
+                st.error(f"Error generando reporte: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────
+# TAB ACCESOS — solo administrador
+# ─────────────────────────────────────────────
+if admin_ok and TAB_ACCESOS is not None:
+    with tabs[TAB_ACCESOS]:
+        st.subheader("👥 Registro de Accesos y Actividad")
+        st.caption("Muestra quién ha ingresado mediciones, cambios y desde qué fecha. Solo visible para administradores.")
+
+        col_a1, col_a2 = st.columns(2)
+
+        with col_a1:
+            st.markdown("#### 📏 Técnicos que han ingresado mediciones")
+            df_acc = cargar_historial(5000)
+            if not df_acc.empty and "usuario" in df_acc.columns:
+                df_acc["fecha_dt"] = pd.to_datetime(df_acc["fecha"], errors="coerce")
+                resumen_usuarios = df_acc.groupby("usuario").agg(
+                    mediciones=("id","count"),
+                    primera=("fecha","min"),
+                    ultima=("fecha","max"),
+                    equipos=("equipo", lambda x: ", ".join(sorted(x.unique())))
+                ).reset_index().sort_values("ultima", ascending=False)
+                resumen_usuarios.columns = ["Técnico","Mediciones","Primera","Última","Equipos"]
+                st.dataframe(resumen_usuarios, use_container_width=True)
+            else:
+                st.info("Sin registros.")
+
+        with col_a2:
+            st.markdown("#### 🔄 Técnicos que han registrado cambios")
+            df_cam_acc = cargar_cambios()
+            if not df_cam_acc.empty:
+                resumen_cambios = df_cam_acc.groupby("usuario").agg(
+                    cambios=("id","count"),
+                    primera=("fecha","min"),
+                    ultima=("fecha","max"),
+                ).reset_index().sort_values("ultima", ascending=False)
+                resumen_cambios.columns = ["Registrado por","Cambios","Primera","Última"]
+                st.dataframe(resumen_cambios, use_container_width=True)
+
+                # Técnicos participantes
+                st.markdown("#### 👷 Técnicos participantes en cambios")
+                tec_list = []
+                for _, r in df_cam_acc.iterrows():
+                    if r.get("tecnico_1"): tec_list.append({"tecnico": r["tecnico_1"], "equipo": r["equipo"], "fecha": r["fecha"]})
+                    if r.get("tecnico_2") and str(r.get("tecnico_2")).strip(): tec_list.append({"tecnico": r["tecnico_2"], "equipo": r["equipo"], "fecha": r["fecha"]})
+                if tec_list:
+                    df_tec = pd.DataFrame(tec_list)
+                    resumen_tec = df_tec.groupby("tecnico").agg(
+                        participaciones=("equipo","count"),
+                        ultima=("fecha","max"),
+                        equipos=("equipo", lambda x: ", ".join(sorted(x.unique())))
+                    ).reset_index().sort_values("participaciones", ascending=False)
+                    resumen_tec.columns = ["Técnico","Participaciones","Última","Equipos"]
+                    st.dataframe(resumen_tec, use_container_width=True)
+            else:
+                st.info("Sin cambios registrados.")
+
+        st.divider()
+        st.markdown("#### 📅 Actividad reciente (últimas 50 acciones)")
+        df_rec = cargar_historial(50)
+        if not df_rec.empty:
+            cols_rec = [c for c in ["fecha","equipo","usuario","estado","mm_usada","horometro"] if c in df_rec.columns]
+            df_rec_show = df_rec[cols_rec].copy()
+            df_rec_show.insert(0, "tipo", "📏 Medición")
+            # Agregar cambios
+            df_cam_rec = cargar_cambios(20)
+            if not df_cam_rec.empty:
+                cols_cam = [c for c in ["fecha","equipo","usuario","horometro"] if c in df_cam_rec.columns]
+                df_cam_show = df_cam_rec[cols_cam].copy()
+                df_cam_show.insert(0, "tipo", "🔄 Cambio GET")
+                df_cam_show["estado"] = "CAMBIO"
+                df_cam_show["mm_usada"] = "—"
+                df_actividad = pd.concat([df_rec_show, df_cam_show], ignore_index=True)
+            else:
+                df_actividad = df_rec_show
+            df_actividad = df_actividad.sort_values("fecha", ascending=False).head(50)
+            st.dataframe(df_actividad, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### 📊 Estadísticas generales")
+        ka, kb, kc, kd = st.columns(4)
+        total_meds = len(cargar_historial(9999)) if not cargar_historial().empty else 0
+        total_tec  = df_acc["usuario"].nunique() if not df_acc.empty and "usuario" in df_acc.columns else 0
+        total_cam  = len(cargar_cambios()) if not cargar_cambios().empty else 0
+        primera_fecha = df_acc["fecha"].min() if not df_acc.empty else "—"
+        ka.metric("Total mediciones", total_meds)
+        kb.metric("Técnicos activos", total_tec)
+        kc.metric("Cambios GET registrados", total_cam)
+        kd.metric("Primera medición", str(primera_fecha)[:10] if primera_fecha != "—" else "—")
+
+
