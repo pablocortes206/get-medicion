@@ -484,7 +484,10 @@ def generar_html_reporte(df_estados: pd.DataFrame, df_sin_medir: pd.DataFrame) -
     <th style="padding:10px;text-align:left;">Última medición</th><th style="padding:10px;text-align:left;">Días sin medir</th>
     </tr></thead><tbody>{filas_sm}</tbody></table>""" if filas_sm else "<p style='color:#44ff88;'>✅ Todos los equipos medidos en los últimos 7 días.</p>"
 
-    semana = datetime.now().isocalendar()[1]
+    hoy_html = date.today()
+    dias_desde_jue = (hoy_html.weekday() - 3) % 7
+    jue_html = hoy_html - timedelta(days=dias_desde_jue)
+    semana = jue_html.isocalendar()[1]
     return f"""<html><body style="font-family:Arial,sans-serif;background:#0f1419;color:#e0e0e0;padding:20px;">
     <div style="max-width:720px;margin:auto;">
       <div style="background:linear-gradient(90deg,#007A3D,#00A04A);padding:20px;border-radius:12px;margin-bottom:20px;">
@@ -762,6 +765,114 @@ def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: st
     doc.save(buf)
     return buf.getvalue()
 
+
+# =========================================================
+# PROYECCIÓN DE FECHAS DE CAMBIO
+# =========================================================
+MIN_MEDS_PROYECCION = 3  # mínimo de mediciones para proyectar
+
+def proyectar_fecha_cambio(equipo: str) -> dict:
+    """
+    Proyecta la fecha de cambio de cuchilla basada en:
+    - Tasa de desgaste calculada desde mediciones reales (mín 3)
+    - Horómetro actual del Excel
+    - mm actual y mm crítico
+    Retorna dict con resultado o error.
+    """
+    try:
+        # Obtener mediciones del ciclo actual
+        uc = ultimo_cambio_equipo(equipo)
+        q = sb().table("mediciones").select("fecha,horometro,mm_usada").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=False)
+        if uc:
+            q = q.gte("fecha", uc["fecha"])
+        meds = q.execute().data or []
+
+        if len(meds) < MIN_MEDS_PROYECCION:
+            return {
+                "ok": False,
+                "error": f"Solo {len(meds)} medición(es) en el ciclo actual. Se necesitan mínimo {MIN_MEDS_PROYECCION} para proyectar.",
+                "meds": len(meds),
+            }
+
+        # Calcular tasa mm/h desde mediciones reales
+        tasas = []
+        for i in range(len(meds)-1):
+            dh  = float(meds[i+1]["horometro"]) - float(meds[i]["horometro"])
+            dmm = float(meds[i]["mm_usada"])     - float(meds[i+1]["mm_usada"])
+            if dh > 0 and dmm > 0:
+                tasas.append(dmm / dh)
+
+        if not tasas:
+            return {"ok": False, "error": "No se pudo calcular tasa — verifica que los mm vayan bajando y el horómetro subiendo.", "meds": len(meds)}
+
+        tasa = sum(tasas) / len(tasas)
+
+        # mm actual (última medición)
+        mm_actual = float(meds[-1]["mm_usada"])
+        horo_actual = float(meds[-1]["horometro"])
+        fecha_ultima_med = meds[-1]["fecha"]
+
+        # Usar horómetro del Excel si es más reciente
+        df_horo = cargar_horometros_db()
+        h_dia = None
+        if not df_horo.empty:
+            row_h = df_horo[df_horo["equipo"] == equipo]
+            if not row_h.empty:
+                h_excel = float(row_h.iloc[0]["horometro_actual"])
+                fecha_excel = row_h.iloc[0]["fecha"]
+                prom = row_h.iloc[0].get("promedio_30d") or row_h.iloc[0].get("promedio_historico")
+                if prom and float(prom) > 0:
+                    h_dia = float(prom)
+                # Si el horómetro del Excel es más reciente, usarlo
+                if h_excel > horo_actual:
+                    horo_actual = h_excel
+
+        # Calcular horas restantes hasta crítico
+        regla = regla_por_equipo(equipo)
+        cfg = REGLAS[regla]
+        mm_critico = cfg["mm_critico"]
+        restante_mm = mm_actual - mm_critico
+
+        if restante_mm <= 0:
+            return {
+                "ok": True,
+                "estado": "CRÍTICO",
+                "mm_actual": mm_actual,
+                "mm_critico": mm_critico,
+                "tasa": round(tasa, 5),
+                "horas_restantes": 0,
+                "fecha_cambio": date.today(),
+                "dias_restantes": 0,
+                "meds": len(meds),
+                "h_dia": h_dia,
+                "confianza": "Alta" if len(meds) >= 5 else "Media",
+            }
+
+        horas_restantes = restante_mm / tasa
+        dias_restantes  = horas_restantes / h_dia if h_dia and h_dia > 0 else horas_restantes / 12
+
+        fecha_cambio = date.today() + timedelta(days=int(dias_restantes))
+
+        confianza = "Alta" if len(meds) >= 5 else ("Media" if len(meds) >= 3 else "Baja")
+
+        return {
+            "ok": True,
+            "estado": "OK" if dias_restantes > 30 else ("MEDIO" if dias_restantes > 14 else ("ALTO" if dias_restantes > 7 else "CRÍTICO")),
+            "mm_actual": mm_actual,
+            "mm_critico": mm_critico,
+            "tasa": round(tasa, 5),
+            "horas_restantes": round(horas_restantes, 1),
+            "dias_restantes": round(dias_restantes, 1),
+            "fecha_cambio": fecha_cambio,
+            "meds": len(meds),
+            "h_dia": round(h_dia, 1) if h_dia else None,
+            "confianza": confianza,
+            "horo_actual": horo_actual,
+            "fecha_ultima_med": fecha_ultima_med,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "meds": 0}
+
 # =========================================================
 # APP UI
 # =========================================================
@@ -807,10 +918,12 @@ tabs_base = [
     "📄 Reporte Ejecutivo",
 ]
 if admin_ok:
+    tabs_base.append("📆 Proyección Cambios")
     tabs_base.append("👥 Accesos")
 
 tabs = st.tabs(tabs_base)
-TAB_ACCESOS = 7 if admin_ok else None
+TAB_PROYECCION = 7 if admin_ok else None
+TAB_ACCESOS    = 8 if admin_ok else None
 
 
 # ─────────────────────────────────────────────
@@ -1125,9 +1238,14 @@ with tabs[5]:
     df_rep    = cargar_historial(5000)
     ultimos_r = ultimos_por_equipo(df_rep)
     df_dias_r = dias_sin_medicion(df_rep)
-    semana    = datetime.now().isocalendar()[1]
+    # Semana operacional Teck: jueves a miércoles
+    # Usamos el jueves de inicio de la semana actual
+    hoy_rep = date.today()
+    dias_desde_jueves = (hoy_rep.weekday() - 3) % 7
+    jueves_semana = hoy_rep - timedelta(days=dias_desde_jueves)
+    semana = jueves_semana.isocalendar()[1]
 
-    st.markdown(f"**Semana {semana} · {date.today()}**")
+    st.markdown(f"**Semana {semana} · Período: {jueves_semana.strftime('%d/%m/%Y')} → {(jueves_semana + timedelta(days=6)).strftime('%d/%m/%Y')}**")
 
     if not ultimos_r.empty:
         st.markdown("#### Estado actual de flota")
@@ -1163,7 +1281,7 @@ with tabs[5]:
             st.markdown(
                 f'<div class="equipo-card" style="background:{bg};">'
                 f'<b>Equipo {row["equipo"]}</b> &nbsp;|&nbsp; {icon} {estado} &nbsp;|&nbsp;'
-                f' {mm} &nbsp;|&nbsp; Desgaste: {pct_html} &nbsp;|&nbsp; Días a crítico: {dias_c_html}'
+                f' {mm} &nbsp;|&nbsp; Desgaste: {pct_html} &nbsp;|&nbsp; Proyección a crítico: {dias_c_html}'
                 f'</div>', unsafe_allow_html=True)
 
         st.divider()
@@ -1311,6 +1429,145 @@ with tabs[6]:
                 st.code(traceback.format_exc())
 
 
+
+
+# ─────────────────────────────────────────────
+# TAB PROYECCIÓN DE CAMBIOS — solo administrador
+# ─────────────────────────────────────────────
+if admin_ok and TAB_PROYECCION is not None:
+    with tabs[TAB_PROYECCION]:
+        st.subheader("📆 Proyección de Fechas de Cambio")
+        st.caption(f"Calcula la fecha estimada de cambio de cuchilla para cada equipo. Requiere mínimo **{MIN_MEDS_PROYECCION} mediciones** en el ciclo actual para proyectar.")
+        st.warning("⚠️ **Modo prueba** — Las proyecciones son estimativas basadas en tasa de desgaste histórica. Validar con medición en terreno.")
+
+        st.divider()
+
+        # Calcular proyección para todos los equipos
+        if st.button("🔄 Calcular proyecciones de toda la flota", type="primary", key="btn_proy_all"):
+            st.session_state["proy_calculada"] = True
+            resultados = {}
+            prog = st.progress(0)
+            for i, eq in enumerate(EQUIPOS):
+                resultados[eq] = proyectar_fecha_cambio(eq)
+                prog.progress((i+1)/len(EQUIPOS))
+            st.session_state["proy_resultados"] = resultados
+            prog.empty()
+
+        if st.session_state.get("proy_calculada") and "proy_resultados" in st.session_state:
+            resultados = st.session_state["proy_resultados"]
+
+            # Separar por estado
+            con_proyeccion = {eq:r for eq,r in resultados.items() if r["ok"]}
+            sin_proyeccion = {eq:r for eq,r in resultados.items() if not r["ok"]}
+
+            # KPIs
+            urgentes  = [eq for eq,r in con_proyeccion.items() if r.get("dias_restantes",999) <= 7]
+            proximos  = [eq for eq,r in con_proyeccion.items() if 7 < r.get("dias_restantes",999) <= 30]
+            normales  = [eq for eq,r in con_proyeccion.items() if r.get("dias_restantes",999) > 30]
+
+            k1,k2,k3,k4 = st.columns(4)
+            k1.metric("🔴 Cambio urgente (≤7 días)",    len(urgentes))
+            k2.metric("🟠 Cambio próximo (8-30 días)",   len(proximos))
+            k3.metric("🟢 Con margen (>30 días)",        len(normales))
+            k4.metric("⚫ Sin datos suficientes",         len(sin_proyeccion))
+
+            st.divider()
+
+            # Tabla principal de proyecciones
+            st.markdown("### Tabla de proyección por equipo")
+
+            filas_proy = []
+            for eq in EQUIPOS:
+                r = resultados.get(eq, {})
+                if r.get("ok"):
+                    dias = r.get("dias_restantes", 0)
+                    if dias <= 7:     urg = "🔴 URGENTE"
+                    elif dias <= 14:  urg = "🟠 ESTA SEMANA"
+                    elif dias <= 30:  urg = "🟡 ESTE MES"
+                    else:             urg = "🟢 CON MARGEN"
+                    filas_proy.append({
+                        "Equipo": eq,
+                        "mm actual": f"{r['mm_actual']:.1f}",
+                        "mm crítico": f"{r['mm_critico']:.0f}",
+                        "Tasa mm/h": f"{r['tasa']:.4f}",
+                        "h/día (Excel)": f"{r['h_dia']:.1f}" if r.get("h_dia") else "—",
+                        "Horas restantes": f"{r['horas_restantes']:.0f} h",
+                        "Días restantes": f"{r['dias_restantes']:.1f}",
+                        "📅 Fecha estimada cambio": r["fecha_cambio"].strftime("%d/%m/%Y"),
+                        "Mediciones ciclo": r["meds"],
+                        "Confianza": r["confianza"],
+                        "Prioridad": urg,
+                    })
+                else:
+                    filas_proy.append({
+                        "Equipo": eq,
+                        "mm actual": "—",
+                        "mm crítico": "—",
+                        "Tasa mm/h": "—",
+                        "h/día (Excel)": "—",
+                        "Horas restantes": "—",
+                        "Días restantes": "—",
+                        "📅 Fecha estimada cambio": "Sin datos",
+                        "Mediciones ciclo": r.get("meds", 0),
+                        "Confianza": "—",
+                        "Prioridad": f"⚫ {r.get('error','Sin datos')[:40]}",
+                    })
+
+            df_proy = pd.DataFrame(filas_proy)
+
+            # Colorear por prioridad
+            def color_prioridad(val):
+                if "URGENTE" in str(val):    return "background-color:#7a0000;color:white"
+                if "ESTA SEMANA" in str(val): return "background-color:#7a3000;color:white"
+                if "ESTE MES" in str(val):    return "background-color:#3d3000;color:white"
+                if "CON MARGEN" in str(val):  return "background-color:#1a3d1a;color:white"
+                return "color:gray"
+
+            st.dataframe(
+                df_proy.style.applymap(color_prioridad, subset=["Prioridad"]),
+                use_container_width=True
+            )
+
+            st.download_button(
+                "⬇️ Descargar proyección Excel",
+                data=excel_bytes(df_proy),
+                file_name=f"proyeccion_cambios_{date.today()}.xlsx",
+                key="dl_proy"
+            )
+
+            st.divider()
+
+            # Detalle por equipo
+            st.markdown("### Detalle por equipo")
+            eq_sel_proy = st.selectbox("Seleccionar equipo para ver detalle", EQUIPOS, key="eq_proy_det")
+            r_det = resultados.get(eq_sel_proy, {})
+
+            if r_det.get("ok"):
+                ca, cb, cc, cd = st.columns(4)
+                ca.metric("mm actual",         f"{r_det['mm_actual']:.1f} mm")
+                cb.metric("mm crítico",         f"{r_det['mm_critico']:.0f} mm")
+                cc.metric("Tasa desgaste",      f"{r_det['tasa']:.4f} mm/h")
+                cd.metric("h/día equipo",       f"{r_det['h_dia']:.1f}" if r_det.get('h_dia') else "—")
+
+                ce, cf, cg, ch = st.columns(4)
+                ce.metric("Horas restantes",    f"{r_det['horas_restantes']:.0f} h")
+                cf.metric("Días restantes",     f"{r_det['dias_restantes']:.1f} días")
+                cg.metric("📅 Fecha estimada",  r_det["fecha_cambio"].strftime("%d/%m/%Y"))
+                ch.metric("Confianza",          r_det["confianza"])
+
+                st.info(f"📊 Basado en **{r_det['meds']} mediciones** del ciclo actual · Última medición: {r_det.get('fecha_ultima_med','—')}")
+
+                if r_det["confianza"] == "Media":
+                    st.warning(f"⚠️ Confianza Media — se tienen {r_det['meds']} mediciones. Con 5 o más la proyección es más precisa.")
+                elif r_det["confianza"] == "Alta":
+                    st.success(f"✅ Confianza Alta — {r_det['meds']} mediciones en el ciclo actual.")
+            else:
+                st.error(f"No se puede proyectar para equipo {eq_sel_proy}: {r_det.get('error','Sin datos')}")
+                st.info(f"Mediciones actuales: {r_det.get('meds',0)} de {MIN_MEDS_PROYECCION} requeridas.")
+        else:
+            st.info("Haz clic en **Calcular proyecciones** para ver las fechas estimadas de cambio.")
+
+
 # ─────────────────────────────────────────────
 # TAB ACCESOS — solo administrador
 # ─────────────────────────────────────────────
@@ -1399,5 +1656,4 @@ if admin_ok and TAB_ACCESOS is not None:
         kb.metric("Técnicos activos", total_tec)
         kc.metric("Cambios GET registrados", total_cam)
         kd.metric("Primera medición", str(primera_fecha)[:10] if primera_fecha != "—" else "—")
-
 
