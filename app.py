@@ -1256,32 +1256,32 @@ with tabs[5]:
             mm     = f"{row['mm_usada']:.1f} mm" if pd.notna(row.get("mm_usada")) else "—"
             pct    = f"{row['condicion_pct']:.1f}%" if pd.notna(row.get("condicion_pct")) else "—"
 
-            # ✅ COLORES DÍAS A CRÍTICO
-            dias_c_val = row.get("dias_a_critico")
-            if pd.notna(dias_c_val):
-                d = float(dias_c_val)
-                if d <= 10:   col_dias = "#44bb44"
-                elif d <= 14: col_dias = "#ffcc00"
-                else:         col_dias = "#ff4444"
-                dias_c_html = f'<span style="background:{col_dias};color:{"black" if d<=14 else "white"};padding:2px 10px;border-radius:6px;font-weight:bold;">{d:.0f} días</span>'
+            # ✅ DÍAS SIN MEDIR
+            fecha_med = row.get("fecha")
+            if fecha_med:
+                dias_sin = (date.today() - pd.to_datetime(fecha_med).date()).days
+                if dias_sin <= 10:   col_sin = "#44bb44"; txt_sin = "black"
+                elif dias_sin <= 14: col_sin = "#ffcc00"; txt_sin = "black"
+                else:                col_sin = "#ff4444"; txt_sin = "white"
+                dias_sin_html = f'<span style="background:{col_sin};color:{txt_sin};padding:2px 10px;border-radius:6px;font-weight:bold;">{dias_sin} días sin medir</span>'
             else:
-                dias_c_html = "—"
+                dias_sin_html = "—"
 
             # ✅ COLOR DESGASTE %
             pct_val = row.get("condicion_pct")
             if pd.notna(pct_val):
                 p = float(pct_val)
-                if p >= 75:   col_pct = "#ff4444"
-                elif p >= 45: col_pct = "#ffcc00"
-                else:         col_pct = "#44bb44"
-                pct_html = f'<span style="background:{col_pct};color:{"black" if p<75 else "white"};padding:2px 10px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
+                if p >= 75:   col_pct = "#ff4444"; txt_pct = "white"
+                elif p >= 45: col_pct = "#ffcc00"; txt_pct = "black"
+                else:         col_pct = "#44bb44"; txt_pct = "black"
+                pct_html = f'<span style="background:{col_pct};color:{txt_pct};padding:2px 10px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
             else:
                 pct_html = "—"
 
             st.markdown(
                 f'<div class="equipo-card" style="background:{bg};">'
                 f'<b>Equipo {row["equipo"]}</b> &nbsp;|&nbsp; {icon} {estado} &nbsp;|&nbsp;'
-                f' {mm} &nbsp;|&nbsp; Desgaste: {pct_html} &nbsp;|&nbsp; Proyección a crítico: {dias_c_html}'
+                f' {mm} &nbsp;|&nbsp; Desgaste: {pct_html} &nbsp;|&nbsp; {dias_sin_html}'
                 f'</div>', unsafe_allow_html=True)
 
         st.divider()
