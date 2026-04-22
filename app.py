@@ -89,7 +89,7 @@ def render_header():
       <div>
         <p style="font-size:52px;font-weight:900;margin:0;line-height:1.05;">GET Wear Monitor</p>
         <p style="font-size:22px;margin:6px 0 0 0;opacity:.92;">Sistema de monitoreo y proyección de desgaste de cuchillas</p>
-        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad</p>
+        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#ffff00;">v9.0 — 22/04/2026</b></p>
       </div>
       <div class="teck-badge">Teck QB2 · GET Wear Monitor</div>
     </div>
@@ -1366,100 +1366,112 @@ with tabs[5]:
 # TAB 7: REPORTE EJECUTIVO
 # ─────────────────────────────────────────────
 with tabs[6]:
-    st.subheader("📄 Reporte Ejecutivo")
-    st.caption("Genera un reporte Word profesional con formato Teck para el período seleccionado.")
+    st.subheader("📋 Resumen de Equipos")
+    st.caption("Estado actual de todos los equipos con última medición, días sin medir y condición.")
 
-    # Semana operacional: jueves a miércoles
-    def semana_operacional(hoy: date):
-        """Retorna (jueves inicio, miércoles fin) de la semana operacional actual."""
-        # weekday(): 0=lunes ... 3=jueves ... 6=domingo
-        dias_desde_jueves = (hoy.weekday() - 3) % 7
-        jueves = hoy - timedelta(days=dias_desde_jueves)
-        miercoles = jueves + timedelta(days=6)
-        return jueves, miercoles
+    df_res = cargar_historial(5000)
+    df_horo_res = cargar_horometros_db()
 
-    jue_default, mie_default = semana_operacional(date.today())
-    st.caption(f"📅 Semana operacional actual: **{jue_default.strftime('%d/%m/%Y')} (Jue) → {mie_default.strftime('%d/%m/%Y')} (Mié)**")
+    if not df_res.empty:
+        hoy = date.today()
+        filas = []
+        for eq in EQUIPOS:
+            df_eq = df_res[df_res["equipo"] == eq]
+            if df_eq.empty:
+                filas.append({
+                    "Equipo": eq, "Última medición": "—", "Días sin medir": "—",
+                    "mm usada": "—", "Desgaste %": "—", "Estado": "SIN DATOS",
+                    "Horómetro medición": "—", "Horómetro Excel": "—",
+                    "Técnico": "—",
+                })
+                continue
 
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        fecha_inicio_rep = st.date_input("Fecha inicio (Jueves)", value=jue_default, key="fi_rep")
-    with col_f2:
-        fecha_fin_rep = st.date_input("Fecha fin (Miércoles)", value=mie_default, key="ff_rep")
-
-    if fecha_fin_rep < fecha_inicio_rep:
-        st.error("La fecha fin debe ser mayor a la fecha inicio.")
-    else:
-        periodo_str = f"{fecha_inicio_rep.strftime('%d %b %Y')} – {fecha_fin_rep.strftime('%d %b %Y')}"
-        fecha_rep_str = fecha_fin_rep.strftime("%d de %B de %Y").replace(
-            "January","Enero").replace("February","Febrero").replace("March","Marzo").replace(
-            "April","Abril").replace("May","Mayo").replace("June","Junio").replace(
-            "July","Julio").replace("August","Agosto").replace("September","Septiembre").replace(
-            "October","Octubre").replace("November","Noviembre").replace("December","Diciembre")
-        semana_rep = fecha_fin_rep.isocalendar()[1]
-
-        st.info(f"**Período:** {periodo_str}  ·  **Semana {semana_rep} / {fecha_fin_rep.year}**")
-
-        if st.button("📄 Generar Reporte Ejecutivo Word", type="primary", key="btn_rep"):
+            last = df_eq.sort_values("fecha", ascending=False).iloc[0]
+            ultima_fecha = str(last.get("fecha",""))[:10]
             try:
-                # Cargar datos del período
-                df_all = cargar_historial(5000)
-                if df_all.empty:
-                    st.error("Sin datos para generar el reporte.")
-                else:
-                    # Usar siempre el último estado de cada equipo (no filtrar por período)
-                    df_all["fecha_dt"] = pd.to_datetime(df_all["fecha"], errors="coerce")
-                    df_ultimos = ultimos_por_equipo(df_all)
+                dias_sin = (hoy - pd.to_datetime(ultima_fecha).date()).days
+                dias_txt = str(dias_sin)
+            except:
+                dias_txt = "—"
 
-                    # Construir lista flota para el reporte
-                    TIPO_EQUIPO = {
-                        "101":"Dozer DZ","102":"Dozer DZ","103":"Dozer DZ","104":"Dozer DZ",
-                        "105":"Dozer DZ","106":"Dozer DZ","108":"Dozer DZ",
-                        "201":"WheelDozer WD","202":"WheelDozer WD","203":"WheelDozer WD",
-                        "204":"WheelDozer WD","205":"WheelDozer WD",
-                        "301":"Motoniveladora GR","302":"Motoniveladora GR","303":"Motoniveladora GR",
-                    }
+            h_excel = "—"
+            if not df_horo_res.empty:
+                row_h = df_horo_res[df_horo_res["equipo"] == eq]
+                if not row_h.empty:
+                    h_excel = f"{row_h.iloc[0]['horometro_actual']:,.0f}"
 
-                    flota_data = []
-                    for eq in EQUIPOS:
-                        row = df_ultimos[df_ultimos["equipo"] == eq]
-                        if row.empty: continue
-                        r = row.iloc[0]
-                        flota_data.append({
-                            "equipo": eq,
-                            "tipo": TIPO_EQUIPO.get(eq, "Equipo"),
-                            "mm": float(r.get("mm_usada", 0)) if pd.notna(r.get("mm_usada")) else 0,
-                            "pct": float(r.get("condicion_pct", 0)) if pd.notna(r.get("condicion_pct")) else 0,
-                            "estado": str(r.get("estado", "OK")),
-                            "tasa": float(r.get("tasa_mm_h", 0)) if pd.notna(r.get("tasa_mm_h")) else None,
-                            "h_crit": float(r.get("horas_a_critico", 0)) if pd.notna(r.get("horas_a_critico")) else None,
-                            "d_crit": float(r.get("dias_a_critico", 0)) if pd.notna(r.get("dias_a_critico")) else None,
-                            "ultima": str(r.get("fecha", "")),
-                            "dias_sin": (date.today() - pd.to_datetime(r.get("fecha")).date()).days if pd.notna(r.get("fecha")) else None,
-                        })
+            estado = str(last.get("estado","—"))
+            mm = f"{last['mm_usada']:.1f}" if pd.notna(last.get("mm_usada")) else "—"
+            pct = f"{last['condicion_pct']:.1f}%" if pd.notna(last.get("condicion_pct")) else "—"
 
-                    # Generar reporte via Python docx
-                    buf = generar_reporte_ejecutivo_docx(
-                        flota_data, periodo_str, fecha_rep_str, semana_rep, fecha_fin_rep.year
-                    )
+            filas.append({
+                "Equipo": eq,
+                "Última medición": ultima_fecha,
+                "Días sin medir": dias_txt,
+                "mm usada": mm,
+                "Desgaste %": pct,
+                "Estado": estado,
+                "Horómetro medición": f"{last['horometro']:,.0f}" if pd.notna(last.get("horometro")) else "—",
+                "Horómetro Excel": h_excel,
+                "Técnico": str(last.get("usuario","—")),
+            })
 
-                    st.success("✅ Reporte generado correctamente.")
-                    st.download_button(
-                        "⬇️ Descargar Reporte Ejecutivo Word",
-                        data=buf,
-                        file_name=f"Reporte_Ejecutivo_GET_S{semana_rep}_{fecha_fin_rep}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="dl_rep"
-                    )
-            except Exception as e:
-                st.error(f"Error generando reporte: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+        df_tabla = pd.DataFrame(filas)
 
+        # Colores por estado
+        def color_estado_row(val):
+            m = {"OK":"background-color:#1a3d1a;color:white",
+                 "MEDIO":"background-color:#3d3000;color:white",
+                 "ALTO":"background-color:#3d1a00;color:white",
+                 "CRÍTICO":"background-color:#3d0000;color:white",
+                 "SIN DATOS":"color:gray"}
+            return m.get(val,"")
 
+        def color_dias_row(val):
+            try:
+                d = int(val)
+                if d <= 10:  return "color:#44bb44;font-weight:bold"
+                if d <= 14:  return "color:#ffcc00;font-weight:bold"
+                return "color:#ff4444;font-weight:bold"
+            except:
+                return "color:gray"
 
+        st.dataframe(
+            df_tabla.style
+                .map(color_estado_row, subset=["Estado"])
+                .map(color_dias_row, subset=["Días sin medir"]),
+            use_container_width=True,
+            height=600
+        )
 
-# ─────────────────────────────────────────────
+        # KPIs rápidos
+        st.divider()
+        k1, k2, k3, k4, k5 = st.columns(5)
+        sin_datos = len([f for f in filas if f["Estado"]=="SIN DATOS"])
+        ok_count  = len([f for f in filas if f["Estado"]=="OK"])
+        med_count = len([f for f in filas if f["Estado"]=="MEDIO"])
+        alt_count = len([f for f in filas if f["Estado"]=="ALTO"])
+        crit_count= len([f for f in filas if f["Estado"]=="CRÍTICO"])
+        k1.metric("🟢 OK", ok_count)
+        k2.metric("🟡 Monitoreo", med_count)
+        k3.metric("🟠 Programar", alt_count)
+        k4.metric("🔴 Crítico", crit_count)
+        k5.metric("⚫ Sin datos", sin_datos)
+
+        # Alertas
+        criticos = [f["Equipo"] for f in filas if f["Estado"] in ("CRÍTICO","ALTO")]
+        atrasados = [f for f in filas if f["Días sin medir"] not in ("—",) and int(f["Días sin medir"]) > 7]
+
+        if criticos:
+            st.error(f"🔴 **Requieren acción inmediata:** {', '.join(criticos)}")
+        if atrasados:
+            txt = ", ".join([f"Eq {f['Equipo']} ({f['Días sin medir']} días)" for f in atrasados])
+            st.warning(f"⚠️ **Sin medir hace más de 7 días:** {txt}")
+        if not criticos and not atrasados:
+            st.success("✅ Todos los equipos al día y en condición normal.")
+    else:
+        st.info("Sin mediciones registradas.")
+
 # TAB PROYECCIÓN DE CAMBIOS — solo administrador
 # ─────────────────────────────────────────────
 if admin_ok and TAB_PROYECCION is not None:
