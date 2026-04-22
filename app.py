@@ -1684,4 +1684,3 @@ if admin_ok and TAB_ACCESOS is not None:
         kb.metric("Técnicos activos", total_tec)
         kc.metric("Cambios GET registrados", total_cam)
         kd.metric("Primera medición", str(primera_fecha)[:10] if primera_fecha != "—" else "—")
-
