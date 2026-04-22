@@ -1248,7 +1248,40 @@ with tabs[5]:
     st.markdown(f"**Semana {semana} · Período: {jueves_semana.strftime('%d/%m/%Y')} → {(jueves_semana + timedelta(days=6)).strftime('%d/%m/%Y')}**")
 
     if not ultimos_r.empty:
-        st.markdown("#### Estado actual de flota")
+        # ── SEMANA EN CURSO ──
+        miercoles_semana = jueves_semana + timedelta(days=6)
+        df_semana = df_rep[
+            (pd.to_datetime(df_rep["fecha"], errors="coerce").dt.date >= jueves_semana) &
+            (pd.to_datetime(df_rep["fecha"], errors="coerce").dt.date <= miercoles_semana)
+        ] if not df_rep.empty else pd.DataFrame()
+        equipos_semana = sorted(df_semana["equipo"].unique().tolist()) if not df_semana.empty else []
+
+        st.markdown(f"#### 📅 Semana {semana} — mediciones del {jueves_semana.strftime('%d/%m')} al {miercoles_semana.strftime('%d/%m/%Y')}")
+        if equipos_semana:
+            st.success(f"✅ **{len(equipos_semana)} equipos medidos esta semana:** {', '.join(equipos_semana)}")
+            ultimos_semana = ultimos_por_equipo(df_semana)
+            for _, row in ultimos_semana.iterrows():
+                estado = str(row.get("estado",""))
+                bg   = BG_ESTADO.get(estado,"#1a1f2e")
+                icon = COLOR_ESTADO.get(estado,"⚪")
+                mm   = f"{row['mm_usada']:.1f} mm" if pd.notna(row.get("mm_usada")) else "—"
+                pct_v = row.get("condicion_pct")
+                if pd.notna(pct_v):
+                    p = float(pct_v)
+                    col_p = "#ff4444" if p>=75 else ("#ffcc00" if p>=45 else "#44bb44")
+                    txt_p = "white" if p>=75 else "black"
+                    pct_html2 = f'<span style="background:{col_p};color:{txt_p};padding:2px 8px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
+                else:
+                    pct_html2 = "—"
+                st.markdown(
+                    f'<div class="equipo-card" style="background:{bg};">'
+                    f'<b>Equipo {row["equipo"]}</b> &nbsp;|&nbsp; {icon} {estado} &nbsp;|&nbsp; {mm} &nbsp;|&nbsp; Desgaste: {pct_html2}'
+                    f'</div>', unsafe_allow_html=True)
+        else:
+            st.warning("⚠️ Sin mediciones registradas en la semana en curso.")
+
+        st.divider()
+        st.markdown("#### 📊 Estado actual de flota (último registro por equipo)")
         for _, row in ultimos_r.iterrows():
             estado = str(row.get("estado",""))
             bg     = BG_ESTADO.get(estado,"#1a1f2e")
@@ -1374,13 +1407,8 @@ with tabs[6]:
                 if df_all.empty:
                     st.error("Sin datos para generar el reporte.")
                 else:
-                    # Filtrar por período
+                    # Usar siempre el último estado de cada equipo (no filtrar por período)
                     df_all["fecha_dt"] = pd.to_datetime(df_all["fecha"], errors="coerce")
-                    df_periodo = df_all[
-                        (df_all["fecha_dt"].dt.date >= fecha_inicio_rep) &
-                        (df_all["fecha_dt"].dt.date <= fecha_fin_rep)
-                    ]
-                    # Últimos estados de cada equipo
                     df_ultimos = ultimos_por_equipo(df_all)
 
                     # Construir lista flota para el reporte
