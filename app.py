@@ -32,7 +32,7 @@ st.set_page_config(page_title="GET Wear Monitor", layout="wide")
 # Esto elimina "SyntaxError: Unexpected end of input" y
 # "Failed to fetch dynamically imported module" de raíz.
 # ─────────────────────────────────────────────────────────
-APP_VERSION = "9.2"   # ← CAMBIAR ESTE NÚMERO EN CADA DEPLOY
+APP_VERSION = "9.3"   # ← CAMBIAR ESTE NÚMERO EN CADA DEPLOY
 
 def enforce_version():
     # Si el browser tiene cacheada una versión distinta a APP_VERSION,
