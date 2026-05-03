@@ -62,83 +62,16 @@ HORO_TOLERANCIA_PCT = 5.0
 
 
 # =========================================================
-# ✅ SOLUCIÓN GLOBAL: AUTO-RECARGA ANTE ERRORES DE MÓDULOS JS
-# Usa st.markdown con unsafe_allow_html para inyectar el script
-# directamente en el DOM principal de Streamlit, SIN usar
-# st.components.v1.html (que crea un iframe y causa
-# "SyntaxError: Unexpected end of input" en componentes React).
-# =========================================================
-def inject_auto_reload():
-    """
-    Inyecta JS anti-chunk-error via st.markdown (NO iframe).
-    Detecta módulos JS obsoletos post-redeploy y recarga la página.
-    Límite de 3 recargas automáticas para evitar loops infinitos.
-    """
-    st.markdown("""
-    <script>
-    (function() {
-        var MAX_RELOADS = 3;
-        var RELOAD_KEY  = 'st_auto_reload_count';
-        var ERROR_KEY   = 'st_module_error_detected';
-
-        function getReloadCount() {
-            return parseInt(sessionStorage.getItem(RELOAD_KEY) || '0', 10);
-        }
-
-        function doReload() {
-            if (getReloadCount() >= MAX_RELOADS) {
-                console.warn('[GET Wear Monitor] Límite de recargas alcanzado. Recarga manualmente con Ctrl+Shift+R.');
-                sessionStorage.removeItem(RELOAD_KEY);
-                return;
-            }
-            sessionStorage.setItem(RELOAD_KEY, String(getReloadCount() + 1));
-            sessionStorage.setItem(ERROR_KEY, '1');
-            window.location.reload(true);
-        }
-
-        function isModuleError(msg) {
-            if (!msg) return false;
-            var m = String(msg).toLowerCase();
-            return (
-                m.includes('failed to fetch dynamically imported module') ||
-                m.includes('chunkloaderror') ||
-                m.includes('loading chunk') ||
-                m.includes('loading css chunk') ||
-                m.includes('importing a module script failed') ||
-                m.includes('syntaxerror: unexpected end of input')
-            );
-        }
-
-        window.addEventListener('error', function(e) {
-            if (isModuleError(e.message)) { e.preventDefault(); doReload(); }
-        }, true);
-
-        window.addEventListener('unhandledrejection', function(e) {
-            var msg = e.reason ? (e.reason.message || String(e.reason)) : '';
-            if (isModuleError(msg)) { e.preventDefault(); doReload(); }
-        });
-
-        window.addEventListener('load', function() {
-            if (sessionStorage.getItem(ERROR_KEY) === '1') {
-                sessionStorage.removeItem(ERROR_KEY);
-                sessionStorage.removeItem(RELOAD_KEY);
-                console.info('[GET Wear Monitor] App recargada correctamente.');
-            }
-        });
-    })();
-    </script>
-    """, unsafe_allow_html=True)
-
-
-# =========================================================
-# LIMPIEZA DE CACHÉ AL INICIAR SESIÓN NUEVA
-# Evita que @st.cache_data sirva datos obsoletos de un
-# deploy anterior cuando el usuario abre una sesión nueva.
+# ✅ SOLUCIÓN GLOBAL: LIMPIEZA DE CACHÉ EN SESIÓN NUEVA
+# Streamlit no permite inyectar JS externo de forma segura.
+# La solución correcta es Python puro:
+#   1. Limpiar st.cache_data en cada sesión nueva -> datos frescos
+#   2. El botón "Actualizar app" en sidebar limpia caché manualmente
+#   3. Si persisten errores JS visuales, usar Ctrl+Shift+R
 # =========================================================
 if "session_iniciada" not in st.session_state:
     st.session_state["session_iniciada"] = True
-    # Solo limpia cache de datos (no de recursos como la conexión Supabase)
-    st.cache_data.clear()
+    st.cache_data.clear()  # fuerza datos frescos en cada sesión nueva
 
 
 # =========================================================
@@ -176,12 +109,8 @@ def render_header():
 
 
 # =========================================================
-# INICIALIZACIÓN: orden correcto e inamovible
-# 1. inject_auto_reload  → JS anti-chunk-error (primero de todo)
-# 2. inject_style        → CSS
-# 3. render_header       → cabecera visual
+# INICIALIZACIÓN
 # =========================================================
-inject_auto_reload()
 inject_style()
 render_header()
 
@@ -945,6 +874,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
+    st.caption("Si ves errores visuales, presiona **Ctrl+Shift+R** (PC) o **Cmd+Shift+R** (Mac) para limpiar el caché del navegador.")
 
     st.divider()
     st.subheader("Administración")
