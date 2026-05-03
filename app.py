@@ -22,6 +22,37 @@ from supabase import create_client, Client
 # =========================================================
 st.set_page_config(page_title="GET Wear Monitor", layout="wide")
 
+# ─────────────────────────────────────────────────────────
+# ✅ SOLUCIÓN DEFINITIVA: CACHE-BUSTER POR VERSIÓN
+# Cada vez que haces un nuevo deploy, sube APP_VERSION.
+# La app detecta si el browser tiene una versión vieja
+# (guardada en st.session_state) y fuerza recarga completa
+# via st.query_params, lo que hace que el browser descarte
+# todos los JS/CSS cacheados y descargue los nuevos.
+# Esto elimina "SyntaxError: Unexpected end of input" y
+# "Failed to fetch dynamically imported module" de raíz.
+# ─────────────────────────────────────────────────────────
+APP_VERSION = "9.2"   # ← CAMBIAR ESTE NÚMERO EN CADA DEPLOY
+
+def enforce_version():
+    # Si el browser tiene cacheada una versión distinta a APP_VERSION,
+    # fuerza recarga con ?v=APP_VERSION en la URL para limpiar el caché.
+    qp = st.query_params.to_dict()
+    version_url = qp.get("v", "")
+    version_session = st.session_state.get("app_version", "")
+
+    if version_url != APP_VERSION:
+        # Browser tiene versión vieja → forzar URL nueva
+        st.query_params["v"] = APP_VERSION
+        st.rerun()
+
+    if version_session != APP_VERSION:
+        # Primera carga con esta versión → limpiar caché de datos
+        st.session_state["app_version"] = APP_VERSION
+        st.cache_data.clear()
+
+enforce_version()
+
 TECK_GREEN   = "#007A3D"
 TECK_GREEN_2 = "#00A04A"
 TECK_DARK    = "#0B0F14"
@@ -61,17 +92,7 @@ BG_ESTADO    = {"OK":"#1a3d1a","MEDIO":"#3d3000","ALTO":"#3d1a00","CRÍTICO":"#3
 HORO_TOLERANCIA_PCT = 5.0
 
 
-# =========================================================
-# ✅ SOLUCIÓN GLOBAL: LIMPIEZA DE CACHÉ EN SESIÓN NUEVA
-# Streamlit no permite inyectar JS externo de forma segura.
-# La solución correcta es Python puro:
-#   1. Limpiar st.cache_data en cada sesión nueva -> datos frescos
-#   2. El botón "Actualizar app" en sidebar limpia caché manualmente
-#   3. Si persisten errores JS visuales, usar Ctrl+Shift+R
-# =========================================================
-if "session_iniciada" not in st.session_state:
-    st.session_state["session_iniciada"] = True
-    st.cache_data.clear()  # fuerza datos frescos en cada sesión nueva
+
 
 
 # =========================================================
@@ -101,7 +122,7 @@ def render_header():
       <div>
         <p style="font-size:52px;font-weight:900;margin:0;line-height:1.05;">GET Wear Monitor</p>
         <p style="font-size:22px;margin:6px 0 0 0;opacity:.92;">Sistema de monitoreo y proyección de desgaste de cuchillas</p>
-        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#ffff00;">v9.1 — 02/05/2026</b></p>
+        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#ffff00;">v9.2 — 03/05/2026</b></p>
       </div>
       <div class="teck-badge">Teck QB2 · GET Wear Monitor</div>
     </div>
@@ -870,11 +891,14 @@ ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "254828")
 
 with st.sidebar:
     # ── Botón de actualización siempre visible ──
-    if st.button("🔄 Actualizar app", help="Limpia caché y recarga datos frescos"):
+    # Limpia caché de datos Y fuerza recarga del browser con ?v=VERSION
+    # para eliminar módulos JS obsoletos tras un redeploy de Streamlit.
+    if st.button("🔄 Actualizar app", help="Recarga completa — elimina errores visuales tras actualizaciones"):
         st.cache_data.clear()
         st.cache_resource.clear()
+        st.session_state.pop("app_version", None)   # fuerza re-check de versión
+        st.query_params["v"] = APP_VERSION
         st.rerun()
-    st.caption("Si ves errores visuales, presiona **Ctrl+Shift+R** (PC) o **Cmd+Shift+R** (Mac) para limpiar el caché del navegador.")
 
     st.divider()
     st.subheader("Administración")
