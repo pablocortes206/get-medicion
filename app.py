@@ -63,22 +63,20 @@ HORO_TOLERANCIA_PCT = 5.0
 
 # =========================================================
 # ✅ SOLUCIÓN GLOBAL: AUTO-RECARGA ANTE ERRORES DE MÓDULOS JS
-# Se ejecuta ANTES que todo lo demás para capturar errores de
-# módulos obsoletos causados por redeployments de Streamlit.
+# Usa st.markdown con unsafe_allow_html para inyectar el script
+# directamente en el DOM principal de Streamlit, SIN usar
+# st.components.v1.html (que crea un iframe y causa
+# "SyntaxError: Unexpected end of input" en componentes React).
 # =========================================================
 def inject_auto_reload():
     """
-    Inyecta un script JS que detecta errores de tipo
-    'Failed to fetch dynamically imported module' (típicos tras
-    un redeploy de Streamlit) y recarga la página automáticamente,
-    sin que el usuario tenga que hacer nada.
-
-    También captura ChunkLoadError y unhandledrejection relacionados.
+    Inyecta JS anti-chunk-error via st.markdown (NO iframe).
+    Detecta módulos JS obsoletos post-redeploy y recarga la página.
+    Límite de 3 recargas automáticas para evitar loops infinitos.
     """
-    st.components.v1.html("""
+    st.markdown("""
     <script>
     (function() {
-        // Máximo de recargas automáticas para evitar loop infinito
         var MAX_RELOADS = 3;
         var RELOAD_KEY  = 'st_auto_reload_count';
         var ERROR_KEY   = 'st_module_error_detected';
@@ -87,21 +85,14 @@ def inject_auto_reload():
             return parseInt(sessionStorage.getItem(RELOAD_KEY) || '0', 10);
         }
 
-        function shouldReload() {
-            return getReloadCount() < MAX_RELOADS;
-        }
-
         function doReload() {
-            if (!shouldReload()) {
-                console.warn('[GET Wear Monitor] Límite de recargas automáticas alcanzado. Recarga manualmente con Ctrl+Shift+R.');
+            if (getReloadCount() >= MAX_RELOADS) {
+                console.warn('[GET Wear Monitor] Límite de recargas alcanzado. Recarga manualmente con Ctrl+Shift+R.');
                 sessionStorage.removeItem(RELOAD_KEY);
                 return;
             }
-            var count = getReloadCount() + 1;
-            sessionStorage.setItem(RELOAD_KEY, String(count));
+            sessionStorage.setItem(RELOAD_KEY, String(getReloadCount() + 1));
             sessionStorage.setItem(ERROR_KEY, '1');
-            console.info('[GET Wear Monitor] Módulo JS obsoleto detectado. Recarga automática #' + count + '...');
-            // Forzar recarga ignorando caché del browser
             window.location.reload(true);
         }
 
@@ -113,39 +104,30 @@ def inject_auto_reload():
                 m.includes('chunkloaderror') ||
                 m.includes('loading chunk') ||
                 m.includes('loading css chunk') ||
-                m.includes('importing a module script failed')
+                m.includes('importing a module script failed') ||
+                m.includes('syntaxerror: unexpected end of input')
             );
         }
 
-        // Captura errores síncronos (ErrorEvent)
         window.addEventListener('error', function(e) {
-            if (isModuleError(e.message)) {
-                e.preventDefault();
-                doReload();
-            }
+            if (isModuleError(e.message)) { e.preventDefault(); doReload(); }
         }, true);
 
-        // Captura promesas rechazadas (Promise rejection)
         window.addEventListener('unhandledrejection', function(e) {
-            var reason = e.reason;
-            var msg = reason ? (reason.message || String(reason)) : '';
-            if (isModuleError(msg)) {
-                e.preventDefault();
-                doReload();
-            }
+            var msg = e.reason ? (e.reason.message || String(e.reason)) : '';
+            if (isModuleError(msg)) { e.preventDefault(); doReload(); }
         });
 
-        // Si la página se cargó bien tras una recarga automática, limpia el contador
         window.addEventListener('load', function() {
             if (sessionStorage.getItem(ERROR_KEY) === '1') {
                 sessionStorage.removeItem(ERROR_KEY);
                 sessionStorage.removeItem(RELOAD_KEY);
-                console.info('[GET Wear Monitor] App cargada correctamente tras recarga automática.');
+                console.info('[GET Wear Monitor] App recargada correctamente.');
             }
         });
     })();
     </script>
-    """, height=0)
+    """, unsafe_allow_html=True)
 
 
 # =========================================================
