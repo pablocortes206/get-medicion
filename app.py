@@ -32,7 +32,7 @@ st.set_page_config(page_title="GET Wear Monitor", layout="wide")
 # Esto elimina "SyntaxError: Unexpected end of input" y
 # "Failed to fetch dynamically imported module" de raíz.
 # ─────────────────────────────────────────────────────────
-APP_VERSION = "9.3"   # ← CAMBIAR ESTE NÚMERO EN CADA DEPLOY
+APP_VERSION = "9.5"   # ← CAMBIAR ESTE NÚMERO EN CADA DEPLOY
 
 def enforce_version():
     # Si el browser tiene cacheada una versión distinta a APP_VERSION,
@@ -122,7 +122,7 @@ def render_header():
       <div>
         <p style="font-size:52px;font-weight:900;margin:0;line-height:1.05;">GET Wear Monitor</p>
         <p style="font-size:22px;margin:6px 0 0 0;opacity:.92;">Sistema de monitoreo y proyección de desgaste de cuchillas</p>
-        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#ffff00;">v9.2 — 03/05/2026</b></p>
+        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#ffff00;">v9.5 — 04/05/2026</b></p>
       </div>
       <div class="teck-badge">Teck QB2 · GET Wear Monitor</div>
     </div>
@@ -355,7 +355,7 @@ def ultimas_meds_equipo(eq: str, n: int = 5) -> list[dict]:
     except Exception:
         return []
 
-def guardar_medicion(fecha, eq, horometro, mm_izq, mm_der, usuario, r):
+def guardar_medicion(fecha, eq, horometro, mm_izq, mm_der, usuario, r, sospechoso=False, comentario_sospecha=""):
     sb().table("mediciones").insert({
         "fecha": str(fecha), "equipo": eq,
         "horometro": float(horometro), "mm_izq": float(mm_izq), "mm_der": float(mm_der),
@@ -365,9 +365,48 @@ def guardar_medicion(fecha, eq, horometro, mm_izq, mm_der, usuario, r):
         "horas_a_critico": float(r["h_critico"]) if r.get("h_critico") is not None else None,
         "dias_a_critico": float(r["d_critico"]) if r.get("d_critico") is not None else None,
         "usuario": usuario.strip(), "componente": "Cuchilla", "es_cambio": False,
+        "sospechoso": sospechoso,
+        "comentario_sospecha": comentario_sospecha if sospechoso else "",
         "creado_en": datetime.utcnow().isoformat(),
     }).execute()
     cargar_historial.clear()
+
+def marcar_sospechosa(id_med: int, sospechoso: bool, comentario: str = ""):
+    sb().table("mediciones").update({
+        "sospechoso": sospechoso,
+        "comentario_sospecha": comentario if sospechoso else "",
+    }).eq("id", int(id_med)).execute()
+    cargar_historial.clear()
+
+def eliminar_medicion(id_med: int):
+    sb().table("mediciones").delete().eq("id", int(id_med)).execute()
+    cargar_historial.clear()
+
+UMBRAL_SOSPECHA_MM = 10.0  # Si sube más de esto sin cambio registrado → sospechoso
+
+def verificar_sospecha(equipo: str, mm_nueva: float) -> dict:
+    """Retorna dict con flag sospechoso y detalle si mm_nueva sube >10mm respecto a última medición."""
+    try:
+        uc = ultimo_cambio_equipo(equipo)
+        q = sb().table("mediciones").select("fecha,mm_usada,horometro").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=True).limit(1)
+        if uc:
+            q = q.gte("fecha", uc["fecha"])
+        data = q.execute().data or []
+        if not data:
+            return {"sospechoso": False}
+        mm_anterior = float(data[0]["mm_usada"])
+        diferencia = mm_nueva - mm_anterior
+        if diferencia >= UMBRAL_SOSPECHA_MM:
+            return {
+                "sospechoso": True,
+                "mm_anterior": mm_anterior,
+                "mm_nueva": mm_nueva,
+                "diferencia": round(diferencia, 1),
+                "comentario_auto": f"Subió {diferencia:.1f} mm ({mm_anterior:.1f} → {mm_nueva:.1f} mm) sin cambio registrado.",
+            }
+        return {"sospechoso": False}
+    except Exception:
+        return {"sospechoso": False}
 
 def actualizar_medicion(id_med: int, horometro: float, mm_izq: float, mm_der: float, usuario_edit: str, eq: str):
     r = evaluar(eq, horometro, mm_izq, mm_der)
@@ -796,90 +835,124 @@ def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: st
 # =========================================================
 # PROYECCIÓN DE FECHAS DE CAMBIO
 # =========================================================
-MIN_MEDS_PROYECCION = 3
+MIN_MEDS_PROYECCION = 2
 
 def proyectar_fecha_cambio(equipo: str) -> dict:
     try:
         uc = ultimo_cambio_equipo(equipo)
-        q = sb().table("mediciones").select("fecha,horometro,mm_usada").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=False)
+        q = sb().table("mediciones").select("fecha,horometro,mm_usada,sospechoso,comentario_sospecha").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=False)
         if uc:
             q = q.gte("fecha", uc["fecha"])
-        meds = q.execute().data or []
+        todas = q.execute().data or []
 
-        if len(meds) < MIN_MEDS_PROYECCION:
-            return {
-                "ok": False,
-                "error": f"Solo {len(meds)} medición(es) en el ciclo actual. Se necesitan mínimo {MIN_MEDS_PROYECCION} para proyectar.",
-                "meds": len(meds),
-            }
+        # Separar sospechosas — se muestran pero no se usan en cálculo
+        sospechosas = [m for m in todas if m.get("sospechoso")]
+        meds = [m for m in todas if not m.get("sospechoso")]
 
-        tasas = []
-        for i in range(len(meds)-1):
-            dh  = float(meds[i+1]["horometro"]) - float(meds[i]["horometro"])
-            dmm = float(meds[i]["mm_usada"])     - float(meds[i+1]["mm_usada"])
-            if dh > 0 and dmm > 0:
-                tasas.append(dmm / dh)
+        regla      = regla_por_equipo(equipo)
+        cfg        = REGLAS[regla]
+        mm_critico = cfg["mm_critico"]
+        tasa_default = 0.028 if regla == "MOTONIVELADORA" else 0.013
 
-        if not tasas:
-            return {"ok": False, "error": "No se pudo calcular tasa — verifica que los mm vayan bajando y el horómetro subiendo.", "meds": len(meds)}
-
-        tasa = sum(tasas) / len(tasas)
-        mm_actual = float(meds[-1]["mm_usada"])
-        horo_actual = float(meds[-1]["horometro"])
-        fecha_ultima_med = meds[-1]["fecha"]
-
+        # ── Cargar horómetro Excel ──────────────────────────
         df_horo = cargar_horometros_db()
-        h_dia = None
+        h_dia = None; horo_excel = None
         if not df_horo.empty:
             row_h = df_horo[df_horo["equipo"] == equipo]
             if not row_h.empty:
-                h_excel = float(row_h.iloc[0]["horometro_actual"])
+                horo_excel = float(row_h.iloc[0]["horometro_actual"])
                 prom = row_h.iloc[0].get("promedio_30d") or row_h.iloc[0].get("promedio_historico")
                 if prom and float(prom) > 0:
                     h_dia = float(prom)
-                if h_excel > horo_actual:
-                    horo_actual = h_excel
 
-        regla = regla_por_equipo(equipo)
-        cfg = REGLAS[regla]
-        mm_critico = cfg["mm_critico"]
-        restante_mm = mm_actual - mm_critico
+        nota_sospechosas = f"{len(sospechosas)} medición(es) sospechosa(s) excluida(s) del cálculo." if sospechosas else ""
+
+        if len(meds) < 1:
+            return {"ok": False, "error": "Sin mediciones válidas en el ciclo actual." + (f" ({nota_sospechosas})" if nota_sospechosas else ""), "meds": 0}
+
+        if len(meds) == 1 and h_dia:
+            mm_actual = float(meds[0]["mm_usada"])
+            restante_mm = mm_actual - mm_critico
+            if restante_mm <= 0:
+                return {"ok": True, "estado": "CRÍTICO", "mm_actual": mm_actual, "mm_critico": mm_critico,
+                        "tasa": None, "tasa_fuente": "Sin tasa", "horas_restantes": 0, "dias_restantes": 0,
+                        "fecha_cambio": date.today(), "meds": len(meds), "h_dia": h_dia,
+                        "confianza": "Muy baja — solo 1 medición válida", "confianza_nivel": 0,
+                        "nota": nota_sospechosas, "anomalias": [], "fecha_ultima_med": meds[0]["fecha"]}
+            horas_restantes = restante_mm / tasa_default
+            dias_restantes = horas_restantes / h_dia
+            return {"ok": True,
+                    "estado": "OK" if dias_restantes > 30 else ("MEDIO" if dias_restantes > 14 else ("ALTO" if dias_restantes > 7 else "CRÍTICO")),
+                    "mm_actual": mm_actual, "mm_critico": mm_critico,
+                    "tasa": round(tasa_default, 5), "tasa_fuente": "Tasa por defecto (1 medición válida)",
+                    "horas_restantes": round(horas_restantes, 1), "dias_restantes": round(dias_restantes, 1),
+                    "fecha_cambio": date.today() + timedelta(days=int(dias_restantes)),
+                    "meds": len(meds), "h_dia": round(h_dia, 1),
+                    "confianza": "Muy baja — 1 medición válida, tasa estimada", "confianza_nivel": 1,
+                    "nota": nota_sospechosas, "anomalias": [], "fecha_ultima_med": meds[0]["fecha"]}
+
+        if len(meds) < 2:
+            return {"ok": False, "error": f"Solo {len(meds)} medición válida y sin horómetros Excel para estimar." + (f" {nota_sospechosas}" if nota_sospechosas else ""), "meds": len(meds)}
+
+        # ── Calcular tasas entre mediciones válidas consecutivas ─
+        tasas_validas = []; anomalias = []
+        for i in range(len(meds) - 1):
+            dh  = float(meds[i+1]["horometro"]) - float(meds[i]["horometro"])
+            dmm = float(meds[i]["mm_usada"])     - float(meds[i+1]["mm_usada"])
+            if dh <= 0:
+                anomalias.append(f"Horómetro no sube entre medición {i+1} y {i+2}")
+                continue
+            if dmm < 0:
+                anomalias.append(f"mm sube {-dmm:.1f} mm entre medición {i+1} y {i+2} — posible cambio no registrado")
+                continue
+            if dmm == 0:
+                continue
+            tasa_i = dmm / dh
+            if tasa_i > tasa_default * 15:
+                anomalias.append(f"Tasa anómala {tasa_i:.4f} mm/h en intervalo {i+1}-{i+2}")
+                continue
+            tasas_validas.append(tasa_i)
+
+        mm_actual    = float(meds[-1]["mm_usada"])
+        horo_actual  = horo_excel or float(meds[-1]["horometro"])
+        fecha_ultima = meds[-1]["fecha"]
+        restante_mm  = mm_actual - mm_critico
+
+        if not tasas_validas:
+            tasa = tasa_default; tasa_fuente = "Tasa por defecto (datos anómalos)"; confianza = "Muy baja — revisar mediciones"; confianza_nivel = 1
+        else:
+            tasa = sum(tasas_validas) / len(tasas_validas)
+            n_valid = len(tasas_validas); n_total = len(meds) - 1
+            tasa_fuente = f"Tasa real ({n_valid}/{n_total} intervalos válidos)" if n_valid < n_total else "Tasa real (todas las mediciones)"
+            if len(meds) >= 5 and n_valid >= 4 and not anomalias:
+                confianza = "Alta"; confianza_nivel = 4
+            elif len(meds) >= 3 and n_valid >= 2:
+                confianza = "Media" + (" — hay anomalías" if anomalias else ""); confianza_nivel = 3
+            else:
+                confianza = "Baja — pocas mediciones"; confianza_nivel = 2
 
         if restante_mm <= 0:
-            return {
-                "ok": True,
-                "estado": "CRÍTICO",
-                "mm_actual": mm_actual,
-                "mm_critico": mm_critico,
-                "tasa": round(tasa, 5),
-                "horas_restantes": 0,
-                "fecha_cambio": date.today(),
-                "dias_restantes": 0,
-                "meds": len(meds),
-                "h_dia": h_dia,
-                "confianza": "Alta" if len(meds) >= 5 else "Media",
-            }
+            return {"ok": True, "estado": "CRÍTICO", "mm_actual": mm_actual, "mm_critico": mm_critico,
+                    "tasa": round(tasa, 5), "tasa_fuente": tasa_fuente, "horas_restantes": 0, "dias_restantes": 0,
+                    "fecha_cambio": date.today(), "meds": len(meds), "h_dia": h_dia,
+                    "confianza": confianza, "confianza_nivel": confianza_nivel,
+                    "anomalias": anomalias, "nota": nota_sospechosas, "fecha_ultima_med": fecha_ultima}
 
         horas_restantes = restante_mm / tasa
         dias_restantes  = horas_restantes / h_dia if h_dia and h_dia > 0 else horas_restantes / 12
-        fecha_cambio = date.today() + timedelta(days=int(dias_restantes))
-        confianza = "Alta" if len(meds) >= 5 else ("Media" if len(meds) >= 3 else "Baja")
+        fecha_cambio    = date.today() + timedelta(days=int(dias_restantes))
 
-        return {
-            "ok": True,
-            "estado": "OK" if dias_restantes > 30 else ("MEDIO" if dias_restantes > 14 else ("ALTO" if dias_restantes > 7 else "CRÍTICO")),
-            "mm_actual": mm_actual,
-            "mm_critico": mm_critico,
-            "tasa": round(tasa, 5),
-            "horas_restantes": round(horas_restantes, 1),
-            "dias_restantes": round(dias_restantes, 1),
-            "fecha_cambio": fecha_cambio,
-            "meds": len(meds),
-            "h_dia": round(h_dia, 1) if h_dia else None,
-            "confianza": confianza,
-            "horo_actual": horo_actual,
-            "fecha_ultima_med": fecha_ultima_med,
-        }
+        return {"ok": True,
+                "estado": "OK" if dias_restantes > 30 else ("MEDIO" if dias_restantes > 14 else ("ALTO" if dias_restantes > 7 else "CRÍTICO")),
+                "mm_actual": mm_actual, "mm_critico": mm_critico,
+                "tasa": round(tasa, 5), "tasa_fuente": tasa_fuente,
+                "horas_restantes": round(horas_restantes, 1), "dias_restantes": round(dias_restantes, 1),
+                "fecha_cambio": fecha_cambio, "meds": len(meds),
+                "h_dia": round(h_dia, 1) if h_dia else None,
+                "confianza": confianza, "confianza_nivel": confianza_nivel,
+                "anomalias": anomalias, "nota": nota_sospechosas,
+                "horo_actual": horo_actual, "fecha_ultima_med": fecha_ultima}
+
     except Exception as e:
         return {"ok": False, "error": str(e), "meds": 0}
 
@@ -911,20 +984,7 @@ with st.sidebar:
         else:
             st.error("Clave incorrecta")
 
-    if admin_ok:
-        st.divider()
-        st.markdown("**🗑️ Eliminar datos de prueba**")
-        st.caption("Elimina todos los registros anteriores al 16 de abril de 2026.")
-        if st.button("Limpiar datos de prueba", type="primary"):
-            try:
-                sb().table("mediciones").delete().lt("fecha", "2026-04-16").execute()
-                sb().table("cambios_cuchilla").delete().lt("fecha", "2026-04-16").execute()
-                cargar_historial.clear()
-                cargar_cambios.clear()
-                st.success("✅ Datos de prueba eliminados.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+
 
 tabs_base = [
     "📏 Ingreso Medición",
@@ -987,7 +1047,32 @@ with tabs[0]:
         if uc:
             st.info(f"📌 Último cambio: {uc['fecha']} · Horómetro: {uc['horometro']:,.0f} hrs")
 
-        if st.button("Guardar medición", type="primary", key="btn_m"):
+        # ── Validación previa de sospecha ──────────────────
+        mm_min_ingreso = min(mm_izq_m, mm_der_m)
+        sospecha_info  = verificar_sospecha(equipo, mm_min_ingreso)
+
+        if sospecha_info["sospechoso"] and "confirmar_sospecha" not in st.session_state:
+            st.warning(
+                f"⚠️ **¿Estás seguro?** El valor subió **{sospecha_info['diferencia']:.1f} mm** "
+                f"({sospecha_info['mm_anterior']:.1f} → {sospecha_info['mm_nueva']:.1f} mm) "
+                f"sin un cambio de cuchilla registrado. Esto es inusual."
+            )
+            col_si, col_no = st.columns(2)
+            with col_si:
+                if st.button("✅ Sí, el valor es correcto — guardar igual", key="btn_confirmar_sospecha"):
+                    st.session_state["confirmar_sospecha"] = True
+                    st.session_state["guardar_pendiente"]  = True
+                    st.rerun()
+            with col_no:
+                if st.button("✏️ No, quiero corregir el valor", key="btn_corregir_sospecha"):
+                    st.session_state.pop("confirmar_sospecha", None)
+                    st.session_state.pop("guardar_pendiente", None)
+                    st.info("Corrige los valores de medición arriba.")
+        else:
+            if st.button("Guardar medición", type="primary", key="btn_m"):
+                st.session_state["guardar_pendiente"] = True
+
+        if st.session_state.pop("guardar_pendiente", False):
             errores = []
             if not usuario_m.strip(): errores.append("Ingresa el nombre del técnico.")
             if horometro_m <= 0:      errores.append("Ingresa un horómetro válido.")
@@ -996,11 +1081,18 @@ with tabs[0]:
             if not (mn <= mm_der_m <= mx): errores.append(f"DER fuera de rango ({mn}–{mx} mm).")
             if errores:
                 for e in errores: st.error(e)
+                st.session_state.pop("confirmar_sospecha", None)
             else:
                 try:
                     r = evaluar(equipo, horometro_m, mm_izq_m, mm_der_m)
-                    guardar_medicion(fecha_m, equipo, horometro_m, mm_izq_m, mm_der_m, usuario_m, r)
-                    st.success("✅ Medición guardada.")
+                    es_sospechosa  = sospecha_info["sospechoso"] and st.session_state.pop("confirmar_sospecha", False)
+                    comentario_s   = sospecha_info.get("comentario_auto", "") if es_sospechosa else ""
+                    guardar_medicion(fecha_m, equipo, horometro_m, mm_izq_m, mm_der_m, usuario_m, r,
+                                     sospechoso=es_sospechosa, comentario_sospecha=comentario_s)
+                    if es_sospechosa:
+                        st.warning(f"⚠️ Medición guardada y marcada como **sospechosa**: {comentario_s}")
+                    else:
+                        st.success("✅ Medición guardada.")
                     ca, cb, cc = st.columns(3)
                     ca.metric("Estado", f"{COLOR_ESTADO.get(r['estado'],'⚪')} {r['estado']}")
                     cb.metric("Desgaste %", f"{r['pct']:.1f}%")
@@ -1022,15 +1114,83 @@ with tabs[0]:
         if not df_eq.empty and "horometro" in df_eq.columns and "mm_usada" in df_eq.columns:
             df_eq = df_eq.dropna(subset=["horometro","mm_usada"]).sort_values("horometro")
             cfg_eq = REGLAS[regla_por_equipo(equipo)]
-            st.line_chart(df_eq.set_index("horometro")[["mm_usada"]], use_container_width=True)
-            st.caption(f"🔴 Límite crítico: {cfg_eq['mm_critico']} mm · 🟢 GET nuevo: {cfg_eq['mm_nuevo']} mm")
+
+            # ── Curva con plotly (estable en todos los browsers) ──
+            try:
+                import plotly.graph_objects as go
+                df_plot = df_eq[["horometro","mm_usada","fecha"]].copy()
+                df_plot["sospechoso"] = df_eq["sospechoso"].fillna(False).astype(bool) if "sospechoso" in df_eq.columns else False
+                df_plot["comentario"] = df_eq["comentario_sospecha"].fillna("") if "comentario_sospecha" in df_eq.columns else ""
+
+                df_ok  = df_plot[~df_plot["sospechoso"]]
+                df_mal = df_plot[df_plot["sospechoso"]]
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df_plot["horometro"], y=df_plot["mm_usada"],
+                    mode="lines", line=dict(color="#4c9be8", width=2),
+                    name="Desgaste", showlegend=False,
+                ))
+                fig.add_trace(go.Scatter(
+                    x=df_ok["horometro"], y=df_ok["mm_usada"],
+                    mode="markers",
+                    marker=dict(color="#4c9be8", size=8, line=dict(color="white", width=1)),
+                    name="Medición OK",
+                    customdata=df_ok[["fecha","comentario"]].values,
+                    hovertemplate="<b>Horómetro:</b> %{x:,.0f} hrs<br><b>mm:</b> %{y:.1f}<br><b>Fecha:</b> %{customdata[0]}<extra></extra>",
+                ))
+                if not df_mal.empty:
+                    fig.add_trace(go.Scatter(
+                        x=df_mal["horometro"], y=df_mal["mm_usada"],
+                        mode="markers",
+                        marker=dict(color="#ff4444", size=14, symbol="x", line=dict(color="#ff4444", width=3)),
+                        name="⚠️ Sospechoso",
+                        customdata=df_mal[["fecha","comentario"]].values,
+                        hovertemplate="<b>⚠️ SOSPECHOSO</b><br>Horómetro: %{x:,.0f}<br>mm: %{y:.1f}<br>Fecha: %{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+                    ))
+                fig.add_hline(y=cfg_eq["mm_critico"], line_dash="dash", line_color="#ff4444",
+                    annotation_text=f"Límite crítico {cfg_eq['mm_critico']} mm",
+                    annotation_position="bottom right", annotation_font_color="#ff8888")
+                fig.add_hline(y=cfg_eq["mm_nuevo"], line_dash="dot", line_color="#44bb44",
+                    annotation_text=f"GET nuevo {cfg_eq['mm_nuevo']} mm",
+                    annotation_position="top right", annotation_font_color="#88dd88")
+                fig.update_layout(
+                    height=300, margin=dict(l=0, r=0, t=10, b=0),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.04)",
+                    font=dict(color="#cccccc"),
+                    xaxis=dict(title="Horómetro (hrs)", gridcolor="rgba(255,255,255,0.08)", color="#aaaaaa"),
+                    yaxis=dict(title="mm usada", gridcolor="rgba(255,255,255,0.08)", color="#aaaaaa"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            except Exception as ex:
+                st.line_chart(df_eq.set_index("horometro")[["mm_usada"]], use_container_width=True)
+                st.caption(f"(modo simple — {ex})")
+
+            st.caption(f"🔴 Límite crítico: {cfg_eq['mm_critico']} mm · 🟢 GET nuevo: {cfg_eq['mm_nuevo']} mm · ✖ Punto sospechoso (excluido de proyección)")
         else:
             st.info("Sin datos suficientes para la curva.")
 
         st.subheader("Últimas mediciones")
         if not df_eq.empty:
-            cols_s = [c for c in ["fecha","horometro","mm_izq","mm_der","mm_usada","condicion_pct","estado","usuario"] if c in df_eq.columns]
-            st.dataframe(df_eq[cols_s].sort_values("fecha",ascending=False).head(10), use_container_width=True)
+            cols_s = [c for c in ["fecha","horometro","mm_izq","mm_der","mm_usada","condicion_pct","estado","sospechoso","comentario_sospecha","usuario"] if c in df_eq.columns]
+            df_show = df_eq[cols_s].sort_values("fecha", ascending=False).head(10).copy()
+            # Agregar columna visual de alerta
+            if "sospechoso" in df_show.columns:
+                df_show["⚠️"] = df_show["sospechoso"].apply(lambda x: "🔴 Sospechoso" if x else "")
+                cols_display = ["fecha","horometro","mm_izq","mm_der","mm_usada","condicion_pct","estado","⚠️","comentario_sospecha","usuario"]
+                cols_display = [c for c in cols_display if c in df_show.columns]
+                df_show = df_show[cols_display]
+
+            def style_sospechosa(row):
+                if row.get("⚠️","") == "🔴 Sospechoso":
+                    return ["background-color:#3d0000;color:#ff8888"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                df_show.style.apply(style_sospechosa, axis=1),
+                use_container_width=True
+            )
         else:
             st.info(f"Sin mediciones para equipo {equipo}.")
 
@@ -1107,46 +1267,101 @@ with tabs[2]:
         st.dataframe(df_sh[cols_h], use_container_width=True)
         st.download_button("⬇️ Descargar Excel", data=excel_bytes(df_sh[cols_h]), file_name="historial.xlsx")
 
+        # ─── SECCIÓN ADMIN: EDITAR / ELIMINAR ───────────────────────
         if admin_ok:
             st.divider()
-            st.markdown("### ✏️ Editar medición (Administrador)")
-            st.caption("Selecciona la medición a corregir — útil para corregir horómetros o mm erróneos.")
+            st.markdown("### 🛠️ Gestión de mediciones — Administrador")
+            st.caption("Selecciona una medición para editarla o eliminarla. Solo visible con clave de administrador.")
 
             df_edit = df_h[["id","fecha","equipo","horometro","mm_izq","mm_der","mm_usada","estado","usuario"]].copy()
+            if "sospechoso" in df_h.columns:
+                df_edit["sospechoso"] = df_h["sospechoso"].fillna(False)
             df_edit["descripcion"] = df_edit.apply(
-                lambda r: f"ID {int(r['id'])} | {r['fecha']} | Eq {r['equipo']} | Horo {r['horometro']:,.0f} | {r['usuario']}", axis=1
+                lambda r: f"ID {int(r['id'])} | {r['fecha']} | Equipo {r['equipo']} | Horo {r['horometro']:,.0f} hrs | {r['mm_usada']:.1f} mm | {r['usuario']}"
+                          + (" 🔴" if r.get("sospechoso") else ""), axis=1
             )
-            sel = st.selectbox("Seleccionar medición a editar", [""] + df_edit["descripcion"].tolist(), key="sel_edit")
+            sel = st.selectbox("🔍 Seleccionar medición", ["— Selecciona una medición —"] + df_edit["descripcion"].tolist(), key="sel_edit")
 
-            if sel:
-                id_edit = int(sel.split("|")[0].replace("ID","").strip())
+            if sel and sel != "— Selecciona una medición —":
+                id_edit  = int(sel.split("|")[0].replace("ID","").strip())
                 row_edit = df_h[df_h["id"] == id_edit].iloc[0]
-                eq_edit = str(row_edit["equipo"])
+                eq_edit  = str(row_edit["equipo"])
+                es_sosp  = bool(row_edit.get("sospechoso", False))
+                com_sosp = str(row_edit.get("comentario_sospecha","") or "")
 
-                st.markdown(f"**Editando:** Equipo {eq_edit} · {row_edit['fecha']} · Usuario original: {row_edit['usuario']}")
+                # ── Tarjeta resumen del registro seleccionado ──
+                color_estado_card = {"OK":"#1a3d1a","MEDIO":"#3d3000","ALTO":"#3d1a00","CRÍTICO":"#3d0000"}.get(str(row_edit.get("estado","")), "#1a2030")
+                st.markdown(f"""
+                <div style="background:{color_estado_card};border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:14px 18px;margin:10px 0 18px 0;">
+                    <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
+                        <div><span style="font-size:11px;opacity:.6;display:block;">EQUIPO</span><b style="font-size:20px;">#{eq_edit}</b></div>
+                        <div><span style="font-size:11px;opacity:.6;display:block;">FECHA</span><b>{row_edit['fecha']}</b></div>
+                        <div><span style="font-size:11px;opacity:.6;display:block;">HORÓMETRO</span><b>{float(row_edit['horometro']):,.0f} hrs</b></div>
+                        <div><span style="font-size:11px;opacity:.6;display:block;">IZQ / DER</span><b>{float(row_edit['mm_izq']):.1f} / {float(row_edit['mm_der']):.1f} mm</b></div>
+                        <div><span style="font-size:11px;opacity:.6;display:block;">ESTADO</span><b>{row_edit.get('estado','—')}</b></div>
+                        <div><span style="font-size:11px;opacity:.6;display:block;">TÉCNICO</span><b>{row_edit['usuario']}</b></div>
+                    </div>
+                    {"<div style=\"margin-top:10px;padding:8px 12px;background:rgba(255,50,50,.2);border-radius:8px;font-size:13px;\">🔴 <b>Sospechosa:</b> " + com_sosp + "</div>" if es_sosp else ""}
+                </div>
+                """, unsafe_allow_html=True)
 
-                ce1, ce2, ce3 = st.columns(3)
-                with ce1:
-                    horo_edit = st.number_input("Horómetro corregido", value=float(row_edit["horometro"]), step=1.0, key="horo_edit")
-                with ce2:
-                    mm_izq_edit = st.number_input("IZQ corregida (mm)", value=float(row_edit["mm_izq"]), step=0.1, key="mi_edit")
-                with ce3:
-                    mm_der_edit = st.number_input("DER corregida (mm)", value=float(row_edit["mm_der"]), step=0.1, key="md_edit")
+                tab_editar, tab_eliminar = st.tabs(["✏️ Editar medición", "🗑️ Eliminar medición"])
 
-                usuario_edit = st.text_input("Nombre del técnico (corrección)", value=str(row_edit["usuario"]), key="u_edit")
+                # ── TAB EDITAR ──────────────────────────────────────
+                with tab_editar:
+                    ce1, ce2, ce3 = st.columns(3)
+                    with ce1:
+                        horo_edit = st.number_input("Horómetro corregido", value=float(row_edit["horometro"]), step=1.0, key="horo_edit")
+                    with ce2:
+                        mm_izq_edit = st.number_input("IZQ corregida (mm)", value=float(row_edit["mm_izq"]), step=0.1, key="mi_edit")
+                    with ce3:
+                        mm_der_edit = st.number_input("DER corregida (mm)", value=float(row_edit["mm_der"]), step=0.1, key="md_edit")
 
-                if horo_edit > 0:
-                    val_edit = validar_horometro(eq_edit, horo_edit)
-                    if not val_edit["ok"]:
-                        st.warning(f"⚠️ Horómetro corregido aún difiere del Excel ({val_edit['h_excel']:,.0f} hrs). Verifica que sea correcto.")
+                    usuario_edit = st.text_input("Registrado por (corrección)", value=str(row_edit["usuario"]), key="u_edit")
 
-                if st.button("💾 Guardar corrección", type="primary", key="btn_edit"):
-                    try:
-                        actualizar_medicion(id_edit, horo_edit, mm_izq_edit, mm_der_edit, usuario_edit, eq_edit)
-                        st.success(f"✅ Medición ID {id_edit} actualizada correctamente.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                    if horo_edit > 0:
+                        val_edit = validar_horometro(eq_edit, horo_edit)
+                        if not val_edit["ok"]:
+                            st.warning(f"⚠️ Horómetro difiere del Excel ({val_edit['h_excel']:,.0f} hrs). Verifica antes de guardar.")
+
+                    col_g1, col_g2 = st.columns(2)
+                    with col_g1:
+                        if st.button("💾 Guardar corrección", type="primary", key="btn_edit"):
+                            try:
+                                actualizar_medicion(id_edit, horo_edit, mm_izq_edit, mm_der_edit, usuario_edit, eq_edit)
+                                st.success(f"✅ Medición ID {id_edit} actualizada correctamente.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                    with col_g2:
+                        if es_sosp:
+                            if st.button("✅ Quitar marca sospechosa", key="btn_no_sosp"):
+                                marcar_sospechosa(id_edit, False)
+                                st.success("Marca sospechosa eliminada.")
+                                st.rerun()
+                        else:
+                            com_manual = st.text_input("Motivo (obligatorio para marcar sospechosa)", key="com_sosp_manual")
+                            if st.button("🔴 Marcar como sospechosa", key="btn_sosp"):
+                                if not com_manual.strip():
+                                    st.error("Ingresa el motivo antes de marcar.")
+                                else:
+                                    marcar_sospechosa(id_edit, True, com_manual.strip())
+                                    st.warning(f"Medición ID {id_edit} marcada como sospechosa.")
+                                    st.rerun()
+
+                # ── TAB ELIMINAR ────────────────────────────────────
+                with tab_eliminar:
+                    st.error(f"⚠️ Estás a punto de eliminar permanentemente la medición **ID {id_edit}** del equipo **{eq_edit}** ({row_edit['fecha']}). Esta acción **no se puede deshacer**.")
+                    st.markdown("Para confirmar, escribe **ELIMINAR** en el campo de abajo:")
+                    confirm_text = st.text_input("Escribe ELIMINAR para confirmar", key="confirm_del_text", placeholder="ELIMINAR")
+                    if confirm_text.strip().upper() == "ELIMINAR":
+                        if st.button("🗑️ Eliminar definitivamente", type="primary", key="btn_del"):
+                            try:
+                                eliminar_medicion(id_edit)
+                                st.success(f"✅ Medición ID {id_edit} eliminada correctamente.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error al eliminar: {e}")
     else:
         st.info("Sin mediciones aún.")
 
