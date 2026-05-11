@@ -22,40 +22,58 @@ from supabase import create_client, Client
 # =========================================================
 st.set_page_config(page_title="GET Wear Monitor", layout="wide")
 
-# ─────────────────────────────────────────────────────────
-# ✅ SOLUCIÓN DEFINITIVA: CACHE-BUSTER POR VERSIÓN
-# Cada vez que haces un nuevo deploy, sube APP_VERSION.
-# La app detecta si el browser tiene una versión vieja
-# (guardada en st.session_state) y fuerza recarga completa
-# via st.query_params, lo que hace que el browser descarte
-# todos los JS/CSS cacheados y descargue los nuevos.
-# Esto elimina "SyntaxError: Unexpected end of input" y
-# "Failed to fetch dynamically imported module" de raíz.
-# ─────────────────────────────────────────────────────────
-APP_VERSION = "9.5"   # ← CAMBIAR ESTE NÚMERO EN CADA DEPLOY
+APP_VERSION = "9.5"
 
 def enforce_version():
-    # Si el browser tiene cacheada una versión distinta a APP_VERSION,
-    # fuerza recarga con ?v=APP_VERSION en la URL para limpiar el caché.
     qp = st.query_params.to_dict()
     version_url = qp.get("v", "")
     version_session = st.session_state.get("app_version", "")
 
     if version_url != APP_VERSION:
-        # Browser tiene versión vieja → forzar URL nueva
         st.query_params["v"] = APP_VERSION
         st.rerun()
 
     if version_session != APP_VERSION:
-        # Primera carga con esta versión → limpiar caché de datos
         st.session_state["app_version"] = APP_VERSION
         st.cache_data.clear()
 
 enforce_version()
 
+# ── PALETA TECK ────────────────────────────────────────────
 TECK_GREEN   = "#007A3D"
 TECK_GREEN_2 = "#00A04A"
 TECK_DARK    = "#0B0F14"
+
+# ── PALETA TECH LEGIBLE (fondo gris claro) ─────────────────
+# Fondos de tarjeta por estado
+BG_OK     = "#F4FAF0"   # verde muy claro
+BG_MEDIO  = "#FFFBF2"   # ámbar muy claro
+BG_ALTO   = "#FFF3EC"   # naranja muy claro
+BG_CRIT   = "#FFF0F0"   # rojo muy claro
+BG_NODAT  = "#F5F5F5"   # gris neutro
+
+# Bordes por estado
+BORDER_OK    = "#C0DD97"
+BORDER_MEDIO = "#FAC775"
+BORDER_ALTO  = "#F0997B"
+BORDER_CRIT  = "#F09595"
+
+# Texto por estado (oscuro del mismo tono)
+TEXT_OK    = "#27500A"
+TEXT_MEDIO = "#633806"
+TEXT_ALTO  = "#712B13"
+TEXT_CRIT  = "#791F1F"
+
+# Badge % desgaste
+PCT_LO_BG  = "#EAF3DE"; PCT_LO_FG  = "#27500A"   # 0-44%
+PCT_MD_BG  = "#FAEEDA"; PCT_MD_FG  = "#633806"   # 45-74%
+PCT_HI_BG  = "#FCEBEB"; PCT_HI_FG  = "#791F1F"   # 75-89%
+PCT_CR_BG  = "#A32D2D"; PCT_CR_FG  = "#FFFFFF"   # 90%+
+
+# Badge días sin medir
+DIAS_OK_BG   = "#EAF3DE"; DIAS_OK_FG   = "#27500A"
+DIAS_MD_BG   = "#FAEEDA"; DIAS_MD_FG   = "#633806"
+DIAS_CR_BG   = "#A32D2D"; DIAS_CR_FG   = "#FFFFFF"
 
 EQUIPOS = [
     "101","102","103","104","105","106","108",
@@ -87,42 +105,200 @@ REGLAS: Dict[str, dict] = {
 }
 
 COLOR_ESTADO = {"OK":"🟢","MEDIO":"🟡","ALTO":"🟠","CRÍTICO":"🔴"}
-BG_ESTADO    = {"OK":"#1a3d1a","MEDIO":"#3d3000","ALTO":"#3d1a00","CRÍTICO":"#3d0000"}
+
+# Mapas de color para tarjetas (bg fila, border, text)
+_ESTADO_CARD = {
+    "OK":     (BG_OK,    BORDER_OK,    TEXT_OK),
+    "MEDIO":  (BG_MEDIO, BORDER_MEDIO, TEXT_MEDIO),
+    "ALTO":   (BG_ALTO,  BORDER_ALTO,  TEXT_ALTO),
+    "CRÍTICO":(BG_CRIT,  BORDER_CRIT,  TEXT_CRIT),
+}
+
+# Mantener BG_ESTADO para compatibilidad con código que lo usa
+BG_ESTADO = {
+    "OK":     BG_OK,
+    "MEDIO":  BG_MEDIO,
+    "ALTO":   BG_ALTO,
+    "CRÍTICO":BG_CRIT,
+}
 
 HORO_TOLERANCIA_PCT = 5.0
 
 
+# =========================================================
+# HELPERS DE COLOR (TECH)
+# =========================================================
 
+def badge_pct_html(pct_val) -> str:
+    """Devuelve HTML de badge de porcentaje con paleta tech legible."""
+    if pct_val is None or not str(pct_val).replace('.','').replace('-','').isdigit():
+        try:
+            p = float(pct_val)
+        except:
+            return "—"
+    else:
+        p = float(pct_val)
+
+    if p >= 90:
+        bg, fg = PCT_CR_BG, PCT_CR_FG
+    elif p >= 75:
+        bg, fg = PCT_HI_BG, PCT_HI_FG
+    elif p >= 45:
+        bg, fg = PCT_MD_BG, PCT_MD_FG
+    else:
+        bg, fg = PCT_LO_BG, PCT_LO_FG
+    return f'<span style="background:{bg};color:{fg};padding:2px 10px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
+
+
+def badge_dias_html(dias: int) -> str:
+    """Devuelve HTML de badge de días sin medir con paleta tech legible."""
+    if dias <= 10:
+        bg, fg = DIAS_OK_BG, DIAS_OK_FG
+    elif dias <= 14:
+        bg, fg = DIAS_MD_BG, DIAS_MD_FG
+    else:
+        bg, fg = DIAS_CR_BG, DIAS_CR_FG
+    return f'<span style="background:{bg};color:{fg};padding:2px 10px;border-radius:6px;font-weight:bold;">{dias} días sin medir</span>'
+
+
+def card_style(estado: str) -> str:
+    """Devuelve el style inline de una tarjeta equipo."""
+    bg, border, _ = _ESTADO_CARD.get(estado, (BG_NODAT, "#D3D1C7", "#444441"))
+    return (
+        f"background:{bg};"
+        f"border:1px solid {border};"
+        f"border-radius:10px;"
+        f"padding:10px 16px;"
+        f"margin-bottom:6px;"
+    )
+
+
+def dot_estado(estado: str) -> str:
+    """Dot de color sólido según estado."""
+    colors = {"OK":"#3B6D11","MEDIO":"#BA7517","ALTO":"#854F0B","CRÍTICO":"#A32D2D"}
+    c = colors.get(estado, "#888780")
+    return f'<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:{c};margin-right:6px;vertical-align:middle;"></span>'
 
 
 # =========================================================
-# ESTILO
+# ESTILO GLOBAL
 # =========================================================
 def inject_style():
     st.markdown(f"""
     <style>
-    .stApp {{background:radial-gradient(1200px 800px at 10% 10%,#101826 0%,{TECK_DARK} 55%,#070A0E 100%);}}
-    .block-container{{padding-top:1rem !important;padding-bottom:2rem !important;}}
-    .teck-header{{display:flex;align-items:center;justify-content:space-between;gap:1rem;
-        padding:16px 20px;border-radius:16px;
-        background:linear-gradient(90deg,rgba(0,122,61,.28) 0%,rgba(0,160,74,.12) 45%,rgba(255,255,255,.03) 100%);
-        border:1px solid rgba(0,160,74,.35);box-shadow:0 12px 30px rgba(0,0,0,.35);margin-bottom:18px;}}
-    .teck-badge{{padding:8px 12px;border-radius:999px;font-size:.85rem;font-weight:800;color:white;
-        background:linear-gradient(180deg,{TECK_GREEN_2} 0%,{TECK_GREEN} 100%);
-        border:1px solid rgba(255,255,255,.18);white-space:nowrap;}}
-    div.stButton>button{{border-radius:12px !important;font-weight:800 !important;}}
-    div.stButton>button[kind="primary"]{{background:linear-gradient(180deg,{TECK_GREEN_2} 0%,{TECK_GREEN} 100%) !important;}}
-    .equipo-card{{padding:12px 16px;border-radius:12px;border:1px solid rgba(255,255,255,.1);margin-bottom:8px;}}
+    /* Fondo principal: gris claro tech */
+    .stApp {{
+        background: #F1EFE8;
+    }}
+    .block-container {{
+        padding-top:1rem !important;
+        padding-bottom:2rem !important;
+    }}
+    /* Header con acento verde Teck sobre gris claro */
+    .teck-header {{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:1rem;
+        padding:16px 20px;
+        border-radius:16px;
+        background:#FFFFFF;
+        border:1px solid {BORDER_OK};
+        border-left:5px solid {TECK_GREEN};
+        box-shadow:0 2px 8px rgba(0,0,0,0.08);
+        margin-bottom:18px;
+    }}
+    .teck-header p {{
+        color:#2C2C2A !important;
+    }}
+    .teck-badge {{
+        padding:8px 14px;
+        border-radius:999px;
+        font-size:.85rem;
+        font-weight:800;
+        color:white;
+        background:{TECK_GREEN};
+        border:1px solid {TECK_GREEN_2};
+        white-space:nowrap;
+    }}
+    /* Botones */
+    div.stButton>button {{
+        border-radius:10px !important;
+        font-weight:700 !important;
+        color:#2C2C2A !important;
+        background:#FFFFFF !important;
+        border:1px solid #D3D1C7 !important;
+    }}
+    div.stButton>button[kind="primary"] {{
+        background:{TECK_GREEN} !important;
+        color:white !important;
+        border-color:{TECK_GREEN_2} !important;
+    }}
+    div.stButton>button[kind="primary"]:hover {{
+        background:{TECK_GREEN_2} !important;
+    }}
+    /* Tarjetas equipo */
+    .equipo-card {{
+        padding:10px 16px;
+        border-radius:10px;
+        margin-bottom:6px;
+    }}
+    /* Texto general más oscuro para legibilidad sobre gris claro */
+    .stMarkdown, .stText, label, .stSelectbox label, .stNumberInput label {{
+        color:#2C2C2A !important;
+    }}
+    /* Métricas */
+    [data-testid="stMetric"] {{
+        background:#FFFFFF;
+        border:1px solid #D3D1C7;
+        border-radius:10px;
+        padding:10px 14px;
+    }}
+    /* Sidebar */
+    [data-testid="stSidebar"] {{
+        background:#FFFFFF;
+        border-right:1px solid #D3D1C7;
+    }}
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {{
+        background:#FFFFFF;
+        border-radius:10px;
+        border:1px solid #D3D1C7;
+        padding:4px;
+    }}
+    .stTabs [data-baseweb="tab"] {{
+        color:#5F5E5A !important;
+        font-weight:600;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background:{TECK_GREEN} !important;
+        color:white !important;
+        border-radius:8px;
+    }}
+    /* Dataframes */
+    [data-testid="stDataFrame"] {{
+        border:1px solid #D3D1C7;
+        border-radius:10px;
+    }}
+    /* Divider */
+    hr {{
+        border-color:#D3D1C7 !important;
+    }}
+    /* Info / Warning / Error boxes */
+    .stAlert {{
+        border-radius:10px !important;
+    }}
     </style>
     """, unsafe_allow_html=True)
+
 
 def render_header():
     st.markdown("""
     <div class="teck-header">
       <div>
-        <p style="font-size:52px;font-weight:900;margin:0;line-height:1.05;">GET Wear Monitor</p>
-        <p style="font-size:22px;margin:6px 0 0 0;opacity:.92;">Sistema de monitoreo y proyección de desgaste de cuchillas</p>
-        <p style="font-size:15px;margin:8px 0 0 0;opacity:.75;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#ffff00;">v9.5 — 04/05/2026</b></p>
+        <p style="font-size:42px;font-weight:900;margin:0;line-height:1.05;color:#0B1E0F !important;">GET Wear Monitor</p>
+        <p style="font-size:18px;margin:6px 0 0 0;color:#3B6D11 !important;">Sistema de monitoreo y proyección de desgaste de cuchillas</p>
+        <p style="font-size:14px;margin:8px 0 0 0;color:#5F5E5A !important;"><b>Creado por:</b> Pablo Cortés Ramos · Ingeniero de Mantenimiento / Confiabilidad &nbsp;|&nbsp; <b style="color:#007A3D;">v9.5 — 04/05/2026</b></p>
       </div>
       <div class="teck-badge">Teck QB2 · GET Wear Monitor</div>
     </div>
@@ -382,10 +558,9 @@ def eliminar_medicion(id_med: int):
     sb().table("mediciones").delete().eq("id", int(id_med)).execute()
     cargar_historial.clear()
 
-UMBRAL_SOSPECHA_MM = 10.0  # Si sube más de esto sin cambio registrado → sospechoso
+UMBRAL_SOSPECHA_MM = 10.0
 
 def verificar_sospecha(equipo: str, mm_nueva: float) -> dict:
-    """Retorna dict con flag sospechoso y detalle si mm_nueva sube >10mm respecto a última medición."""
     try:
         uc = ultimo_cambio_equipo(equipo)
         q = sb().table("mediciones").select("fecha,mm_usada,horometro").eq("equipo", equipo).eq("es_cambio", False).order("fecha", desc=True).limit(1)
@@ -474,10 +649,11 @@ def dias_sin_medicion(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def color_dias(dias) -> str:
-    if dias is None: return "#666666"
-    if dias <= 10:   return "#44bb44"
-    if dias <= 14:   return "#ffcc00"
-    return "#ff4444"
+    """Color de texto para días sin medir (compatible con código legacy)."""
+    if dias is None: return "#888780"
+    if dias <= 10:   return "#3B6D11"
+    if dias <= 14:   return "#BA7517"
+    return "#A32D2D"
 
 
 # =========================================================
@@ -507,41 +683,53 @@ def validar_horometro(equipo: str, horometro_ingresado: float) -> dict:
 # REPORTE CORREO
 # =========================================================
 def color_estado_html(estado: str) -> str:
-    m = {"OK":"#1a5c1a","MEDIO":"#7a6000","ALTO":"#7a3000","CRÍTICO":"#7a0000","SIN DATOS":"#333"}
-    return m.get(estado, "#333")
+    m = {"OK": PCT_LO_BG, "MEDIO": PCT_MD_BG, "ALTO":"#FAEEDA","CRÍTICO": PCT_CR_BG,"SIN DATOS":"#F1EFE8"}
+    return m.get(estado, "#F1EFE8")
+
+def color_estado_text_html(estado: str) -> str:
+    m = {"OK": TEXT_OK, "MEDIO": TEXT_MEDIO, "ALTO": TEXT_ALTO, "CRÍTICO":"#FFFFFF","SIN DATOS":"#888780"}
+    return m.get(estado, "#444441")
 
 def texto_estado_html(estado: str) -> str:
     m = {"OK":"✅ OK","MEDIO":"🟡 Monitoreo","ALTO":"🟠 Programar cambio","CRÍTICO":"🔴 CRÍTICO","SIN DATOS":"⚫ Sin datos"}
     return m.get(estado, estado)
 
 def color_dias_html(dias) -> str:
-    if dias is None: return "#666"
-    if dias <= 10:   return "#1a5c1a"
-    if dias <= 14:   return "#7a6000"
-    return "#7a0000"
+    if dias is None: return "#F1EFE8"
+    if dias <= 10:   return PCT_LO_BG
+    if dias <= 14:   return PCT_MD_BG
+    return PCT_CR_BG
+
+def color_dias_text_html(dias) -> str:
+    if dias is None: return "#888780"
+    if dias <= 10:   return TEXT_OK
+    if dias <= 14:   return TEXT_MEDIO
+    return "#FFFFFF"
 
 def generar_html_reporte(df_estados: pd.DataFrame, df_sin_medir: pd.DataFrame) -> str:
     filas = ""
     if not df_estados.empty:
         for _, r in df_estados.iterrows():
             est = str(r.get("estado",""))
-            bg_est = color_estado_html(est)
+            bg_est  = color_estado_html(est)
+            fg_est  = color_estado_text_html(est)
             txt_est = texto_estado_html(est)
             mm  = f"{r['mm_usada']:.1f}" if pd.notna(r.get("mm_usada")) else "—"
             pct = f"{r['condicion_pct']:.1f}%" if pd.notna(r.get("condicion_pct")) else "—"
             dias_c_val = r.get("dias_a_critico")
             if pd.notna(dias_c_val):
                 dias_c_num = float(dias_c_val)
-                bg_dias = color_dias_html(dias_c_num)
-                dias_c = f'<span style="background:{bg_dias};color:white;padding:2px 8px;border-radius:4px;">{dias_c_num:.0f} días</span>'
+                bg_dc = color_dias_html(dias_c_num)
+                fg_dc = color_dias_text_html(dias_c_num)
+                dias_c = f'<span style="background:{bg_dc};color:{fg_dc};padding:2px 8px;border-radius:4px;">{dias_c_num:.0f} días</span>'
             else:
                 dias_c = "—"
             filas += f"""<tr>
-              <td style="padding:8px;font-weight:bold;">{r['equipo']}</td>
-              <td style="padding:8px;">{r.get('fecha','—')}</td>
-              <td style="padding:8px;">{mm} mm</td>
-              <td style="padding:8px;">{pct}</td>
-              <td style="padding:8px;background:{bg_est};border-radius:6px;text-align:center;">{txt_est}</td>
+              <td style="padding:8px;font-weight:bold;color:#2C2C2A;">{r['equipo']}</td>
+              <td style="padding:8px;color:#444441;">{r.get('fecha','—')}</td>
+              <td style="padding:8px;color:#444441;">{mm} mm</td>
+              <td style="padding:8px;color:#444441;">{pct}</td>
+              <td style="padding:8px;background:{bg_est};color:{fg_est};border-radius:6px;text-align:center;font-weight:bold;">{txt_est}</td>
               <td style="padding:8px;">{dias_c}</td>
             </tr>"""
 
@@ -550,35 +738,36 @@ def generar_html_reporte(df_estados: pd.DataFrame, df_sin_medir: pd.DataFrame) -
     for _, r in sin_medir.iterrows():
         d = int(r['dias_sin_medir'])
         bg = color_dias_html(d)
-        filas_sm += f"<tr><td style='padding:8px;font-weight:bold;'>{r['equipo']}</td><td style='padding:8px;'>{r.get('ultima_medicion','—')}</td><td style='padding:8px;'><span style='background:{bg};color:white;padding:2px 8px;border-radius:4px;'>{d} días</span></td></tr>"
+        fg = color_dias_text_html(d)
+        filas_sm += f"<tr><td style='padding:8px;font-weight:bold;color:#2C2C2A;'>{r['equipo']}</td><td style='padding:8px;color:#444441;'>{r.get('ultima_medicion','—')}</td><td style='padding:8px;'><span style='background:{bg};color:{fg};padding:2px 8px;border-radius:4px;font-weight:bold;'>{d} días</span></td></tr>"
 
-    tabla_sm = f"""<h2 style="color:#ff9900;margin-top:30px;">⚠️ Sin medir hace más de 7 días</h2>
-    <table style="width:100%;border-collapse:collapse;background:#1a1f2e;border-radius:8px;">
-    <thead><tr style="background:#7a3000;color:white;"><th style="padding:10px;text-align:left;">Equipo</th>
+    tabla_sm = f"""<h2 style="color:#A32D2D;margin-top:30px;">⚠️ Sin medir hace más de 7 días</h2>
+    <table style="width:100%;border-collapse:collapse;background:#FFFFFF;border-radius:8px;border:1px solid #D3D1C7;">
+    <thead><tr style="background:{TECK_GREEN};color:white;"><th style="padding:10px;text-align:left;">Equipo</th>
     <th style="padding:10px;text-align:left;">Última medición</th><th style="padding:10px;text-align:left;">Días sin medir</th>
-    </tr></thead><tbody>{filas_sm}</tbody></table>""" if filas_sm else "<p style='color:#44ff88;'>✅ Todos los equipos medidos en los últimos 7 días.</p>"
+    </tr></thead><tbody>{filas_sm}</tbody></table>""" if filas_sm else "<p style='color:#27500A;font-weight:bold;'>✅ Todos los equipos medidos en los últimos 7 días.</p>"
 
     hoy_html = date.today()
     dias_desde_jue = (hoy_html.weekday() - 3) % 7
     jue_html = hoy_html - timedelta(days=dias_desde_jue)
     semana = jue_html.isocalendar()[1]
-    return f"""<html><body style="font-family:Arial,sans-serif;background:#0f1419;color:#e0e0e0;padding:20px;">
+    return f"""<html><body style="font-family:Arial,sans-serif;background:#F1EFE8;color:#2C2C2A;padding:20px;">
     <div style="max-width:720px;margin:auto;">
-      <div style="background:linear-gradient(90deg,#007A3D,#00A04A);padding:20px;border-radius:12px;margin-bottom:20px;">
+      <div style="background:{TECK_GREEN};padding:20px;border-radius:12px;margin-bottom:20px;">
         <h1 style="color:white;margin:0;">GET Wear Monitor</h1>
-        <p style="color:rgba(255,255,255,.85);margin:4px 0 0 0;">Reporte Semana {semana} · {date.today()}</p>
-        <p style="color:rgba(255,255,255,.7);margin:2px 0 0 0;font-size:13px;">Teck QB2 · Pablo Cortés Ramos</p>
+        <p style="color:rgba(255,255,255,.9);margin:4px 0 0 0;">Reporte Semana {semana} · {date.today()}</p>
+        <p style="color:rgba(255,255,255,.75);margin:2px 0 0 0;font-size:13px;">Teck QB2 · Pablo Cortés Ramos</p>
       </div>
-      <h2 style="color:#00A04A;">Estado de flota</h2>
-      <table style="width:100%;border-collapse:collapse;background:#1a1f2e;border-radius:8px;">
-        <thead><tr style="background:#007A3D;color:white;">
+      <h2 style="color:{TECK_GREEN};">Estado de flota</h2>
+      <table style="width:100%;border-collapse:collapse;background:#FFFFFF;border-radius:8px;border:1px solid #D3D1C7;">
+        <thead><tr style="background:{TECK_GREEN};color:white;">
           <th style="padding:10px;text-align:left;">Equipo</th><th style="padding:10px;text-align:left;">Última medición</th>
           <th style="padding:10px;text-align:left;">mm</th><th style="padding:10px;text-align:left;">Desgaste</th>
           <th style="padding:10px;text-align:left;">Estado</th><th style="padding:10px;text-align:left;">Días a crítico</th>
         </tr></thead><tbody>{filas}</tbody>
       </table>
       {tabla_sm}
-      <p style="margin-top:30px;color:#555;font-size:12px;">GET Wear Monitor · Teck QB2</p>
+      <p style="margin-top:30px;color:#888780;font-size:12px;">GET Wear Monitor · Teck QB2</p>
     </div></body></html>"""
 
 
@@ -622,16 +811,16 @@ def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: st
     from docx.oxml import OxmlElement
 
     TECK_BLUE  = RGBColor(0x1F, 0x6F, 0xAE)
-    TECK_GREEN = RGBColor(0x00, 0x7A, 0x3D)
-    TECK_DARK  = RGBColor(0x0D, 0x1F, 0x2D)
+    TECK_GREEN_docx = RGBColor(0x00, 0x7A, 0x3D)
+    TECK_DARK_docx  = RGBColor(0x0D, 0x1F, 0x2D)
     GRAY       = RGBColor(0x4A, 0x55, 0x68)
 
-    OK_BG    = "D4EDDA"; OK_FG    = RGBColor(0x15, 0x57, 0x24)
-    MED_BG   = "FFF3CD"; MED_FG   = RGBColor(0x85, 0x64, 0x04)
-    ALT_BG   = "FFE0B2"; ALT_FG   = RGBColor(0xE6, 0x51, 0x00)
-    CRIT_BG  = "F8D7DA"; CRIT_FG  = RGBColor(0x72, 0x1C, 0x24)
-    DIAS_OK  = "D4EDDA"; DIAS_MED = "FFF3CD"; DIAS_CRIT = "F8D7DA"
-    LIGHT_BG = "EBF5FB"
+    OK_BG    = "EAF3DE"; OK_FG    = RGBColor(0x27, 0x50, 0x0A)
+    MED_BG   = "FAEEDA"; MED_FG   = RGBColor(0x63, 0x38, 0x06)
+    ALT_BG   = "FCEBEB"; ALT_FG   = RGBColor(0x71, 0x2B, 0x13)
+    CRIT_BG  = "A32D2D"; CRIT_FG  = RGBColor(255, 255, 255)
+    DIAS_OK  = "EAF3DE"; DIAS_MED = "FAEEDA"; DIAS_CRIT = "A32D2D"
+    LIGHT_BG = "F4FAF0"
 
     def status_colors(estado):
         m = {"OK":(OK_BG,OK_FG),"MEDIO":(MED_BG,MED_FG),"ALTO":(ALT_BG,ALT_FG),"CRÍTICO":(CRIT_BG,CRIT_FG)}
@@ -640,9 +829,9 @@ def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: st
     def dias_colors(dias):
         if dias is None: return (OK_BG, OK_FG)
         d = float(dias)
-        if d <= 10:  return (DIAS_OK,  RGBColor(0x1B,0x5E,0x20))
-        if d <= 14:  return (DIAS_MED, RGBColor(0xF5,0x7F,0x17))
-        return (DIAS_CRIT, RGBColor(0xB7,0x1C,0x1C))
+        if d <= 10:  return (DIAS_OK,  RGBColor(0x27,0x50,0x0A))
+        if d <= 14:  return (DIAS_MED, RGBColor(0x63,0x38,0x06))
+        return (DIAS_CRIT, RGBColor(255,255,255))
 
     def pct_colors(pct):
         if pct is None: return (OK_BG, OK_FG)
@@ -686,7 +875,7 @@ def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: st
     title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = title_p.add_run("REPORTE EJECUTIVO")
     run.font.name = "Arial"; run.font.size = Pt(28); run.font.bold = True
-    run.font.color.rgb = TECK_DARK
+    run.font.color.rgb = TECK_DARK_docx
 
     sub_p = doc.add_paragraph()
     sub_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -739,7 +928,7 @@ def generar_reporte_ejecutivo_docx(flota_data: list, periodo: str, fecha_str: st
     widths_cm = [1.5, 3.5, 2.0, 2.0, 2.5, 2.5, 2.5]
     for i,(hdr,w) in enumerate(zip(headers,widths_cm)):
         cell_h = t.cell(0,i)
-        set_cell_bg(cell_h, "1F6FAE")
+        set_cell_bg(cell_h, "007A3D")
         add_cell(cell_h, hdr, bold=True, color=RGBColor(255,255,255), size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
 
     for ri, f in enumerate(flota_sorted):
@@ -845,7 +1034,6 @@ def proyectar_fecha_cambio(equipo: str) -> dict:
             q = q.gte("fecha", uc["fecha"])
         todas = q.execute().data or []
 
-        # Separar sospechosas — se muestran pero no se usan en cálculo
         sospechosas = [m for m in todas if m.get("sospechoso")]
         meds = [m for m in todas if not m.get("sospechoso")]
 
@@ -854,7 +1042,6 @@ def proyectar_fecha_cambio(equipo: str) -> dict:
         mm_critico = cfg["mm_critico"]
         tasa_default = 0.028 if regla == "MOTONIVELADORA" else 0.013
 
-        # ── Cargar horómetro Excel ──────────────────────────
         df_horo = cargar_horometros_db()
         h_dia = None; horo_excel = None
         if not df_horo.empty:
@@ -894,7 +1081,6 @@ def proyectar_fecha_cambio(equipo: str) -> dict:
         if len(meds) < 2:
             return {"ok": False, "error": f"Solo {len(meds)} medición válida y sin horómetros Excel para estimar." + (f" {nota_sospechosas}" if nota_sospechosas else ""), "meds": len(meds)}
 
-        # ── Calcular tasas entre mediciones válidas consecutivas ─
         tasas_validas = []; anomalias = []
         for i in range(len(meds) - 1):
             dh  = float(meds[i+1]["horometro"]) - float(meds[i]["horometro"])
@@ -963,13 +1149,10 @@ def proyectar_fecha_cambio(equipo: str) -> dict:
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "254828")
 
 with st.sidebar:
-    # ── Botón de actualización siempre visible ──
-    # Limpia caché de datos Y fuerza recarga del browser con ?v=VERSION
-    # para eliminar módulos JS obsoletos tras un redeploy de Streamlit.
     if st.button("🔄 Actualizar app", help="Recarga completa — elimina errores visuales tras actualizaciones"):
         st.cache_data.clear()
         st.cache_resource.clear()
-        st.session_state.pop("app_version", None)   # fuerza re-check de versión
+        st.session_state.pop("app_version", None)
         st.query_params["v"] = APP_VERSION
         st.rerun()
 
@@ -983,7 +1166,6 @@ with st.sidebar:
             st.success("✅ Modo administrador activo")
         else:
             st.error("Clave incorrecta")
-
 
 
 tabs_base = [
@@ -1047,7 +1229,6 @@ with tabs[0]:
         if uc:
             st.info(f"📌 Último cambio: {uc['fecha']} · Horómetro: {uc['horometro']:,.0f} hrs")
 
-        # ── Validación previa de sospecha ──────────────────
         mm_min_ingreso = min(mm_izq_m, mm_der_m)
         sospecha_info  = verificar_sospecha(equipo, mm_min_ingreso)
 
@@ -1115,7 +1296,6 @@ with tabs[0]:
             df_eq = df_eq.dropna(subset=["horometro","mm_usada"]).sort_values("horometro")
             cfg_eq = REGLAS[regla_por_equipo(equipo)]
 
-            # ── Curva con plotly (estable en todos los browsers) ──
             try:
                 import plotly.graph_objects as go
                 df_plot = df_eq[["horometro","mm_usada","fecha"]].copy()
@@ -1128,13 +1308,13 @@ with tabs[0]:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=df_plot["horometro"], y=df_plot["mm_usada"],
-                    mode="lines", line=dict(color="#4c9be8", width=2),
+                    mode="lines", line=dict(color=TECK_GREEN, width=2),
                     name="Desgaste", showlegend=False,
                 ))
                 fig.add_trace(go.Scatter(
                     x=df_ok["horometro"], y=df_ok["mm_usada"],
                     mode="markers",
-                    marker=dict(color="#4c9be8", size=8, line=dict(color="white", width=1)),
+                    marker=dict(color=TECK_GREEN_2, size=8, line=dict(color=TECK_GREEN, width=1)),
                     name="Medición OK",
                     customdata=df_ok[["fecha","comentario"]].values,
                     hovertemplate="<b>Horómetro:</b> %{x:,.0f} hrs<br><b>mm:</b> %{y:.1f}<br><b>Fecha:</b> %{customdata[0]}<extra></extra>",
@@ -1143,23 +1323,23 @@ with tabs[0]:
                     fig.add_trace(go.Scatter(
                         x=df_mal["horometro"], y=df_mal["mm_usada"],
                         mode="markers",
-                        marker=dict(color="#ff4444", size=14, symbol="x", line=dict(color="#ff4444", width=3)),
+                        marker=dict(color="#A32D2D", size=14, symbol="x", line=dict(color="#A32D2D", width=3)),
                         name="⚠️ Sospechoso",
                         customdata=df_mal[["fecha","comentario"]].values,
                         hovertemplate="<b>⚠️ SOSPECHOSO</b><br>Horómetro: %{x:,.0f}<br>mm: %{y:.1f}<br>Fecha: %{customdata[0]}<br>%{customdata[1]}<extra></extra>",
                     ))
-                fig.add_hline(y=cfg_eq["mm_critico"], line_dash="dash", line_color="#ff4444",
+                fig.add_hline(y=cfg_eq["mm_critico"], line_dash="dash", line_color="#A32D2D",
                     annotation_text=f"Límite crítico {cfg_eq['mm_critico']} mm",
-                    annotation_position="bottom right", annotation_font_color="#ff8888")
-                fig.add_hline(y=cfg_eq["mm_nuevo"], line_dash="dot", line_color="#44bb44",
+                    annotation_position="bottom right", annotation_font_color="#A32D2D")
+                fig.add_hline(y=cfg_eq["mm_nuevo"], line_dash="dot", line_color="#3B6D11",
                     annotation_text=f"GET nuevo {cfg_eq['mm_nuevo']} mm",
-                    annotation_position="top right", annotation_font_color="#88dd88")
+                    annotation_position="top right", annotation_font_color="#3B6D11")
                 fig.update_layout(
                     height=300, margin=dict(l=0, r=0, t=10, b=0),
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.04)",
-                    font=dict(color="#cccccc"),
-                    xaxis=dict(title="Horómetro (hrs)", gridcolor="rgba(255,255,255,0.08)", color="#aaaaaa"),
-                    yaxis=dict(title="mm usada", gridcolor="rgba(255,255,255,0.08)", color="#aaaaaa"),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.8)",
+                    font=dict(color="#2C2C2A"),
+                    xaxis=dict(title="Horómetro (hrs)", gridcolor="#D3D1C7", color="#444441"),
+                    yaxis=dict(title="mm usada", gridcolor="#D3D1C7", color="#444441"),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
@@ -1175,7 +1355,6 @@ with tabs[0]:
         if not df_eq.empty:
             cols_s = [c for c in ["fecha","horometro","mm_izq","mm_der","mm_usada","condicion_pct","estado","sospechoso","comentario_sospecha","usuario"] if c in df_eq.columns]
             df_show = df_eq[cols_s].sort_values("fecha", ascending=False).head(10).copy()
-            # Agregar columna visual de alerta
             if "sospechoso" in df_show.columns:
                 df_show["⚠️"] = df_show["sospechoso"].apply(lambda x: "🔴 Sospechoso" if x else "")
                 cols_display = ["fecha","horometro","mm_izq","mm_der","mm_usada","condicion_pct","estado","⚠️","comentario_sospecha","usuario"]
@@ -1184,7 +1363,7 @@ with tabs[0]:
 
             def style_sospechosa(row):
                 if row.get("⚠️","") == "🔴 Sospechoso":
-                    return ["background-color:#3d0000;color:#ff8888"] * len(row)
+                    return [f"background-color:{BG_CRIT};color:{TEXT_CRIT}"] * len(row)
                 return [""] * len(row)
 
             st.dataframe(
@@ -1267,7 +1446,6 @@ with tabs[2]:
         st.dataframe(df_sh[cols_h], use_container_width=True)
         st.download_button("⬇️ Descargar Excel", data=excel_bytes(df_sh[cols_h]), file_name="historial.xlsx")
 
-        # ─── SECCIÓN ADMIN: EDITAR / ELIMINAR ───────────────────────
         if admin_ok:
             st.divider()
             st.markdown("### 🛠️ Gestión de mediciones — Administrador")
@@ -1289,25 +1467,23 @@ with tabs[2]:
                 es_sosp  = bool(row_edit.get("sospechoso", False))
                 com_sosp = str(row_edit.get("comentario_sospecha","") or "")
 
-                # ── Tarjeta resumen del registro seleccionado ──
-                color_estado_card = {"OK":"#1a3d1a","MEDIO":"#3d3000","ALTO":"#3d1a00","CRÍTICO":"#3d0000"}.get(str(row_edit.get("estado","")), "#1a2030")
+                bg_card, border_card, text_card = _ESTADO_CARD.get(str(row_edit.get("estado","")), (BG_NODAT, "#D3D1C7", "#444441"))
                 st.markdown(f"""
-                <div style="background:{color_estado_card};border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:14px 18px;margin:10px 0 18px 0;">
+                <div style="background:{bg_card};border:1px solid {border_card};border-radius:12px;padding:14px 18px;margin:10px 0 18px 0;">
                     <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
-                        <div><span style="font-size:11px;opacity:.6;display:block;">EQUIPO</span><b style="font-size:20px;">#{eq_edit}</b></div>
-                        <div><span style="font-size:11px;opacity:.6;display:block;">FECHA</span><b>{row_edit['fecha']}</b></div>
-                        <div><span style="font-size:11px;opacity:.6;display:block;">HORÓMETRO</span><b>{float(row_edit['horometro']):,.0f} hrs</b></div>
-                        <div><span style="font-size:11px;opacity:.6;display:block;">IZQ / DER</span><b>{float(row_edit['mm_izq']):.1f} / {float(row_edit['mm_der']):.1f} mm</b></div>
-                        <div><span style="font-size:11px;opacity:.6;display:block;">ESTADO</span><b>{row_edit.get('estado','—')}</b></div>
-                        <div><span style="font-size:11px;opacity:.6;display:block;">TÉCNICO</span><b>{row_edit['usuario']}</b></div>
+                        <div><span style="font-size:11px;color:{text_card};opacity:.7;display:block;">EQUIPO</span><b style="font-size:20px;color:{text_card};">#{eq_edit}</b></div>
+                        <div><span style="font-size:11px;color:{text_card};opacity:.7;display:block;">FECHA</span><b style="color:{text_card};">{row_edit['fecha']}</b></div>
+                        <div><span style="font-size:11px;color:{text_card};opacity:.7;display:block;">HORÓMETRO</span><b style="color:{text_card};">{float(row_edit['horometro']):,.0f} hrs</b></div>
+                        <div><span style="font-size:11px;color:{text_card};opacity:.7;display:block;">IZQ / DER</span><b style="color:{text_card};">{float(row_edit['mm_izq']):.1f} / {float(row_edit['mm_der']):.1f} mm</b></div>
+                        <div><span style="font-size:11px;color:{text_card};opacity:.7;display:block;">ESTADO</span><b style="color:{text_card};">{row_edit.get('estado','—')}</b></div>
+                        <div><span style="font-size:11px;color:{text_card};opacity:.7;display:block;">TÉCNICO</span><b style="color:{text_card};">{row_edit['usuario']}</b></div>
                     </div>
-                    {"<div style=\"margin-top:10px;padding:8px 12px;background:rgba(255,50,50,.2);border-radius:8px;font-size:13px;\">🔴 <b>Sospechosa:</b> " + com_sosp + "</div>" if es_sosp else ""}
+                    {"<div style=\"margin-top:10px;padding:8px 12px;background:" + BG_CRIT + ";border-radius:8px;font-size:13px;color:" + TEXT_CRIT + ";\">🔴 <b>Sospechosa:</b> " + com_sosp + "</div>" if es_sosp else ""}
                 </div>
                 """, unsafe_allow_html=True)
 
                 tab_editar, tab_eliminar = st.tabs(["✏️ Editar medición", "🗑️ Eliminar medición"])
 
-                # ── TAB EDITAR ──────────────────────────────────────
                 with tab_editar:
                     ce1, ce2, ce3 = st.columns(3)
                     with ce1:
@@ -1349,7 +1525,6 @@ with tabs[2]:
                                     st.warning(f"Medición ID {id_edit} marcada como sospechosa.")
                                     st.rerun()
 
-                # ── TAB ELIMINAR ────────────────────────────────────
                 with tab_eliminar:
                     st.error(f"⚠️ Estás a punto de eliminar permanentemente la medición **ID {id_edit}** del equipo **{eq_edit}** ({row_edit['fecha']}). Esta acción **no se puede deshacer**.")
                     st.markdown("Para confirmar, escribe **ELIMINAR** en el campo de abajo:")
@@ -1395,11 +1570,11 @@ with tabs[3]:
         def color_fila_dias(val):
             try:
                 v = float(val)
-                if v <= 10:  return "color:#44bb44;font-weight:bold"
-                if v <= 14:  return "color:#ffcc00;font-weight:bold"
-                return "color:#ff4444;font-weight:bold"
+                if v <= 10:  return f"color:{DIAS_OK_FG};font-weight:bold"
+                if v <= 14:  return f"color:{DIAS_MD_FG};font-weight:bold"
+                return f"color:{DIAS_CR_BG};font-weight:bold"
             except:
-                return "color:gray"
+                return "color:#888780"
 
         st.dataframe(
             df_dias.style.map(color_fila_dias, subset=["dias_sin_medir"]),
@@ -1486,20 +1661,18 @@ with tabs[5]:
             ultimos_semana = ultimos_por_equipo(df_semana)
             for _, row in ultimos_semana.iterrows():
                 estado = str(row.get("estado",""))
-                bg   = BG_ESTADO.get(estado,"#1a1f2e")
-                icon = COLOR_ESTADO.get(estado,"⚪")
-                mm   = f"{row['mm_usada']:.1f} mm" if pd.notna(row.get("mm_usada")) else "—"
-                pct_v = row.get("condicion_pct")
-                if pd.notna(pct_v):
-                    p = float(pct_v)
-                    col_p = "#ff4444" if p>=75 else ("#ffcc00" if p>=45 else "#44bb44")
-                    txt_p = "white" if p>=75 else "black"
-                    pct_html2 = f'<span style="background:{col_p};color:{txt_p};padding:2px 8px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
-                else:
-                    pct_html2 = "—"
+                icon   = COLOR_ESTADO.get(estado,"⚪")
+                mm     = f"{row['mm_usada']:.1f} mm" if pd.notna(row.get("mm_usada")) else "—"
+                pct_val = row.get("condicion_pct")
+                pct_html2 = badge_pct_html(pct_val) if pd.notna(pct_val) else "—"
+                st_style = card_style(estado)
+                bg, border, txt = _ESTADO_CARD.get(estado, (BG_NODAT, "#D3D1C7", "#444441"))
                 st.markdown(
-                    f'<div class="equipo-card" style="background:{bg};">'
-                    f'<b>Equipo {row["equipo"]}</b> &nbsp;|&nbsp; {icon} {estado} &nbsp;|&nbsp; {mm} &nbsp;|&nbsp; Desgaste: {pct_html2}'
+                    f'<div style="{st_style}">'
+                    f'{dot_estado(estado)}<b style="color:{txt};">Equipo {row["equipo"]}</b>'
+                    f' &nbsp;|&nbsp; <span style="color:{txt};">{icon} {estado}</span>'
+                    f' &nbsp;|&nbsp; <span style="color:{txt};">{mm}</span>'
+                    f' &nbsp;|&nbsp; Desgaste: {pct_html2}'
                     f'</div>', unsafe_allow_html=True)
         else:
             st.warning("⚠️ Sin mediciones registradas en la semana en curso.")
@@ -1508,34 +1681,26 @@ with tabs[5]:
         st.markdown("#### 📊 Estado actual de flota (último registro por equipo)")
         for _, row in ultimos_r.iterrows():
             estado = str(row.get("estado",""))
-            bg     = BG_ESTADO.get(estado,"#1a1f2e")
             icon   = COLOR_ESTADO.get(estado,"⚪")
             mm     = f"{row['mm_usada']:.1f} mm" if pd.notna(row.get("mm_usada")) else "—"
+            bg, border, txt = _ESTADO_CARD.get(estado, (BG_NODAT, "#D3D1C7", "#444441"))
 
             fecha_med = row.get("fecha")
+            dias_sin_html = "—"
             if fecha_med:
                 dias_sin = (date.today() - pd.to_datetime(fecha_med).date()).days
-                if dias_sin <= 10:   col_sin = "#44bb44"; txt_sin = "black"
-                elif dias_sin <= 14: col_sin = "#ffcc00"; txt_sin = "black"
-                else:                col_sin = "#ff4444"; txt_sin = "white"
-                dias_sin_html = f'<span style="background:{col_sin};color:{txt_sin};padding:2px 10px;border-radius:6px;font-weight:bold;">{dias_sin} días sin medir</span>'
-            else:
-                dias_sin_html = "—"
+                dias_sin_html = badge_dias_html(dias_sin)
 
             pct_val = row.get("condicion_pct")
-            if pd.notna(pct_val):
-                p = float(pct_val)
-                if p >= 75:   col_pct = "#ff4444"; txt_pct = "white"
-                elif p >= 45: col_pct = "#ffcc00"; txt_pct = "black"
-                else:         col_pct = "#44bb44"; txt_pct = "black"
-                pct_html = f'<span style="background:{col_pct};color:{txt_pct};padding:2px 10px;border-radius:6px;font-weight:bold;">{p:.1f}%</span>'
-            else:
-                pct_html = "—"
+            pct_html = badge_pct_html(pct_val) if pd.notna(pct_val) else "—"
 
             st.markdown(
-                f'<div class="equipo-card" style="background:{bg};">'
-                f'<b>Equipo {row["equipo"]}</b> &nbsp;|&nbsp; {icon} {estado} &nbsp;|&nbsp;'
-                f' {mm} &nbsp;|&nbsp; Desgaste: {pct_html} &nbsp;|&nbsp; {dias_sin_html}'
+                f'<div style="{card_style(estado)}">'
+                f'{dot_estado(estado)}<b style="color:{txt};">Equipo {row["equipo"]}</b>'
+                f' &nbsp;|&nbsp; <span style="color:{txt};">{icon} {estado}</span>'
+                f' &nbsp;|&nbsp; <span style="color:{txt};">{mm}</span>'
+                f' &nbsp;|&nbsp; Desgaste: {pct_html}'
+                f' &nbsp;|&nbsp; {dias_sin_html}'
                 f'</div>', unsafe_allow_html=True)
 
         st.divider()
@@ -1544,11 +1709,12 @@ with tabs[5]:
         if not sin_medir_r.empty:
             for _, r in sin_medir_r.iterrows():
                 d = int(r["dias_sin_medir"])
-                c = color_dias(d)
                 st.markdown(
-                    f'<div class="equipo-card" style="background:#1a1f2e;">'
-                    f'<b>Equipo {r["equipo"]}</b> &nbsp;|&nbsp; Última medición: {r["ultima_medicion"]} &nbsp;|&nbsp;'
-                    f' <span style="color:{c};font-weight:bold;">{d} días sin medir</span>'
+                    f'<div style="{card_style("MEDIO") if d <= 14 else card_style("CRÍTICO")}">'
+                    f'{dot_estado("MEDIO" if d <= 14 else "CRÍTICO")}'
+                    f'<b>Equipo {r["equipo"]}</b>'
+                    f' &nbsp;|&nbsp; Última medición: {r["ultima_medicion"]}'
+                    f' &nbsp;|&nbsp; {badge_dias_html(d)}'
                     f'</div>', unsafe_allow_html=True)
         else:
             st.success("✅ Todos los equipos medidos en los últimos 7 días.")
@@ -1639,21 +1805,23 @@ with tabs[6]:
         df_tabla = pd.DataFrame(filas)
 
         def color_estado_row(val):
-            m = {"OK":"background-color:#1a3d1a;color:white",
-                 "MEDIO":"background-color:#3d3000;color:white",
-                 "ALTO":"background-color:#3d1a00;color:white",
-                 "CRÍTICO":"background-color:#3d0000;color:white",
-                 "SIN DATOS":"color:gray"}
+            m = {
+                "OK":       f"background-color:{BG_OK};color:{TEXT_OK}",
+                "MEDIO":    f"background-color:{BG_MEDIO};color:{TEXT_MEDIO}",
+                "ALTO":     f"background-color:{BG_ALTO};color:{TEXT_ALTO}",
+                "CRÍTICO":  f"background-color:{BG_CRIT};color:{TEXT_CRIT}",
+                "SIN DATOS":f"color:#888780",
+            }
             return m.get(val,"")
 
         def color_dias_row(val):
             try:
                 d = int(val)
-                if d <= 10:  return "color:#44bb44;font-weight:bold"
-                if d <= 14:  return "color:#ffcc00;font-weight:bold"
-                return "color:#ff4444;font-weight:bold"
+                if d <= 10:  return f"color:{DIAS_OK_FG};font-weight:bold"
+                if d <= 14:  return f"color:{DIAS_MD_FG};font-weight:bold"
+                return f"color:{DIAS_CR_BG};font-weight:bold"
             except:
-                return "color:gray"
+                return "color:#888780"
 
         st.dataframe(
             df_tabla.style
@@ -1687,7 +1855,6 @@ with tabs[6]:
         if not criticos and not atrasados:
             st.success("✅ Todos los equipos al día y en condición normal.")
 
-        # ── Botón para generar DOCX ejecutivo ──
         st.divider()
         st.markdown("#### Generar Reporte Ejecutivo Word (.docx)")
         col_d1, col_d2 = st.columns(2)
@@ -1814,14 +1981,14 @@ if admin_ok and TAB_PROYECCION is not None:
             df_proy = pd.DataFrame(filas_proy)
 
             def color_prioridad(val):
-                if "URGENTE" in str(val):     return "background-color:#7a0000;color:white"
-                if "ESTA SEMANA" in str(val): return "background-color:#7a3000;color:white"
-                if "ESTE MES" in str(val):    return "background-color:#3d3000;color:white"
-                if "CON MARGEN" in str(val):  return "background-color:#1a3d1a;color:white"
-                return "color:gray"
+                if "URGENTE"    in str(val): return f"background-color:{BG_CRIT};color:{TEXT_CRIT}"
+                if "ESTA SEMANA"in str(val): return f"background-color:{BG_ALTO};color:{TEXT_ALTO}"
+                if "ESTE MES"   in str(val): return f"background-color:{BG_MEDIO};color:{TEXT_MEDIO}"
+                if "CON MARGEN" in str(val): return f"background-color:{BG_OK};color:{TEXT_OK}"
+                return "color:#888780"
 
             st.dataframe(
-                df_proy.style.applymap(color_prioridad, subset=["Prioridad"]),
+                df_proy.style.map(color_prioridad, subset=["Prioridad"]),
                 use_container_width=True
             )
 
@@ -1948,4 +2115,3 @@ if admin_ok and TAB_ACCESOS is not None:
         ka.metric("Total mediciones", total_meds)
         kb.metric("Técnicos activos", total_tec)
         kc.metric("Cambios GET registrados", total_cam)
-        kd.metric("Primera medición", str(primera_fecha)[:10] if primera_fecha != "—" else "—")
